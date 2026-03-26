@@ -2,20 +2,72 @@ import torch
 import numpy as np
 import pdb
 
-def federated_aggregation(local_models, weights):
-    stack = torch.stack(local_models)
+def federated_aggregation(stack, weights):
     avg = torch.sum(stack * weights.view(-1,1), dim=0)
     return avg
 
-def p2p_aggregation(spoke_wts, W):
+def p2p_aggregation(leaf_wts, W):
     """
-    W: shape [num_spokes, num_spokes]
-    spoke_wts: shape [num_spokes, dim]
-    returns: shape [num_spokes, dim]
+    W: shape [num_leaves, num_leaves]
+    leaf_wts: shape [num_leaves, dim]
+    returns: shape [num_leaves, dim]
     """
-    return torch.mm(W, spoke_wts)
+    return torch.mm(W, leaf_wts)
 
-def p2p_local_aggregation(node_wts, outdegree, return_W=False):
+def p2p_local_aggregation(node_wts, outdegree, return_W=False, alive_mask=None):
+    """
+    node_wts: shape [num_nodes, dim]
+    outdegree: int
+    return_W: bool -> if True, also return the effective mixing matrix
+    """
+    num_nodes = node_wts.shape[0]
+    device = node_wts.device
+    
+    # 1. Create the Topology Matrix (W)
+    # We initialize W as zeros. 
+    # Even if return_W is False, we use W internally for efficient matmul aggregation.
+    W = torch.zeros((num_nodes, num_nodes), device=device)
+
+    # We still loop to generate random neighbors (topology), 
+    # but we DO NOT do heavy tensor math inside this loop.
+    for i in range(num_nodes):
+        # Create a pool of neighbors excluding the node itself
+        all_neighbors = torch.arange(num_nodes, device=device)
+        all_neighbors = all_neighbors[all_neighbors != i]  # Exclude self
+
+        # Pick random neighbors
+        if outdegree <= num_nodes - 1:
+            chosen_neighbors = all_neighbors[torch.randperm(all_neighbors.size(0))[:outdegree]]
+        else:
+            chosen_neighbors = all_neighbors[torch.randint(0, all_neighbors.size(0), (outdegree,))]
+        
+        # Apply alive mask if needed
+        if alive_mask is not None:
+            chosen_neighbors = chosen_neighbors[alive_mask[chosen_neighbors]]
+        
+        # Set connection weights to 1.0 (Uniform averaging)
+        # Self-connection
+        W[i, i] = 1.0 
+        # Neighbor connections
+        W[i, chosen_neighbors] = 1.0
+
+    # 2. Normalize Rows (Row-Stochastic)
+    # This creates the "mean" effect. 
+    # If a node connects to 3 neighbors + itself = 4 nodes, every weight becomes 0.25
+    row_sums = W.sum(dim=1, keepdim=True)
+    # Avoid division by zero if a node somehow has no connections (unlikely with self-loop)
+    W = W / (row_sums + 1e-10)
+
+    # 3. Aggregate (One-Shot Matrix Multiplication)
+    # This replaces the slow loop of .mean() calls
+    updated_wts = torch.mm(W, node_wts)
+
+    if return_W:
+        return updated_wts, W
+    else:
+        return updated_wts
+        
+def old_p2p_local_aggregation(node_wts, outdegree, return_W=False, alive_mask=None):
     """
     node_wts: shape [num_nodes, dim]
     outdegree: int
@@ -40,7 +92,10 @@ def p2p_local_aggregation(node_wts, outdegree, return_W=False):
             chosen_neighbors = all_neighbors[torch.randperm(all_neighbors.size(0))[:outdegree]]
         else:
             chosen_neighbors = all_neighbors[torch.randint(0, all_neighbors.size(0), (outdegree,))]
-
+        
+        if alive_mask is not None:
+            chosen_neighbors = chosen_neighbors[alive_mask[chosen_neighbors]]
+        
         # Include the node itself
         chosen = torch.cat((chosen_neighbors, torch.tensor([i], device=node_wts.device)))
         neighbors_models = node_wts[chosen]

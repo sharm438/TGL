@@ -12,6 +12,16 @@ def load_net(net_name, num_inp, num_out, device):
     elif net_name=='cifar_cnn':
         #model = CIFAR_CNN(num_classes=num_out)
         model = ResNet20(num_classes=num_out)
+        #model = VisionTransformer(num_classes=num_out)
+        # model = VisionTransformer(
+        #     num_classes=10,  # For CIFAR-10
+        #     dim=768,
+        #     depth=12,
+        #     heads=12,
+        #     mlp_dim=3072  # 4 * dim
+        # )
+
+
     elif net_name=='agnews_net':
         model = SmallTransformer(vocab_size=95812)
         #model = TextRNN(vocab_size=95812, embed_dim=128, hidden_dim=256, num_classes=num_out)
@@ -27,6 +37,88 @@ def load_net(net_name, num_inp, num_out, device):
         model = models.resnet50(num_classes=100)
     model.to(device)
     return model
+
+class Transpose(nn.Module):
+    def __init__(self, dim0, dim1):
+        super().__init__()
+        self.dim0 = dim0
+        self.dim1 = dim1
+
+    def forward(self, x):
+        return x.transpose(self.dim0, self.dim1)
+
+class VisionTransformer(nn.Module):
+    """
+    Standard Vision Transformer (ViT) for CIFAR-10.
+    
+    Args:
+        image_size (int): Size of the input image (e.g., 32 for CIFAR-10).
+        patch_size (int): Size of the patches to be extracted from the image.
+        num_classes (int): Number of output classes.
+        dim (int): Dimensionality of the embedding space.
+        depth (int): Number of transformer blocks.
+        heads (int): Number of attention heads.
+        mlp_dim (int): Dimensionality of the MLP layer in the transformer block.
+        channels (int): Number of input channels (3 for RGB).
+        dropout (float): Dropout rate.
+    """
+    def __init__(self, *, image_size=32, patch_size=4, num_classes=10, dim=512, depth=6, heads=8, mlp_dim=512, channels=3, dropout=0.1):
+        super().__init__()
+        
+        num_patches = (image_size // patch_size) ** 2
+        patch_dim = channels * (patch_size ** 2)
+        
+        # 1. Patch embedding
+        # We use a Conv2D layer for efficiency. It acts as a linear projection of flattened patches.
+        self.patch_to_embedding = nn.Sequential(
+            nn.Conv2d(channels, dim, kernel_size=patch_size, stride=patch_size),
+            nn.Flatten(2),
+            Transpose(1, 2)
+        )
+
+        # 2. Positional and class token embeddings
+        self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + 1, dim))
+        self.cls_token = nn.Parameter(torch.randn(1, 1, dim)) # Learnable token for classification
+        self.dropout = nn.Dropout(dropout)
+
+        # 3. Transformer Encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=dim, 
+            nhead=heads, 
+            dim_feedforward=mlp_dim,
+            dropout=dropout,
+            activation='gelu', # GELU is common in Transformers
+            batch_first=True # Expects (batch, seq, feature)
+        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=depth)
+
+        # 4. MLP Head for classification
+        self.mlp_head = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, num_classes)
+        )
+
+    def forward(self, img):
+        # Patch embedding
+        x = self.patch_to_embedding(img) # Shape: [batch, num_patches, dim]
+        b, n, _ = x.shape
+
+        # Prepend class token
+        cls_tokens = self.cls_token.repeat(b, 1, 1) # Shape: [batch, 1, dim]
+        x = torch.cat((cls_tokens, x), dim=1) # Shape: [batch, num_patches + 1, dim]
+
+        # Add positional embedding
+        x += self.pos_embedding[:, :(n + 1)]
+        x = self.dropout(x)
+
+        # Transformer encoder
+        x = self.transformer_encoder(x) # Shape: [batch, num_patches + 1, dim]
+
+        # Get the class token's output for classification
+        cls_output = x[:, 0] # Shape: [batch, dim]
+
+        # MLP head
+        return self.mlp_head(cls_output)
 
 class FEMNIST_CNN(nn.Module):
     """
@@ -185,10 +277,10 @@ class BasicBlock(nn.Module):
         super().__init__()
         self.conv1 = nn.Conv2d(in_planes, planes, 3, stride,
                                padding=1, bias=False)
-        self.bn1   = nn.BatchNorm2d(planes)
+        self.bn1   = nn.GroupNorm(8, planes)
         self.conv2 = nn.Conv2d(planes, planes, 3, 1,
                                padding=1, bias=False)
-        self.bn2   = nn.BatchNorm2d(planes)
+        self.bn2   = nn.GroupNorm(8, planes)
 
         self.shortcut = nn.Sequential()
         if stride != 1 or in_planes != planes:
@@ -196,7 +288,7 @@ class BasicBlock(nn.Module):
             # but 1×1 conv is simpler and widely used today.
             self.shortcut = nn.Sequential(
                 nn.Conv2d(in_planes, planes, 1, stride, bias=False),
-                nn.BatchNorm2d(planes)
+                nn.GroupNorm(8, planes)
             )
 
     def forward(self, x):
@@ -211,7 +303,7 @@ class ResNet20(nn.Module):
         self.in_planes = 16
 
         self.conv1 = nn.Conv2d(3, 16, 3, 1, 1, bias=False)
-        self.bn1   = nn.BatchNorm2d(16)
+        self.bn1   = nn.GroupNorm(8, 16)
 
         # 3 blocks per layer for depth-20
         self.layer1 = self._make_layer(16, 3, stride=1)

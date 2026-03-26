@@ -2,8 +2,9 @@ import argparse
 import torch
 import os
 import time
-import utils
-import models
+
+import utils as utils
+import models as models
 from copy import deepcopy
 import pdb
 
@@ -37,16 +38,6 @@ def local_train_worker_inline(
     # We'll iterate 'num_local_iters' times over mini-batches
     idx_start = rr_indices[node_id]
     for _ in range(num_local_iters):
-        # if sample_type == 'round_robin':
-        #     # take the next batch sequentially
-        #     end_idx = idx_start + batch_size
-        #     if end_idx > local_data.shape[0]:
-        #         # wrap around
-        #         end_idx = batch_size
-        #         idx_start = 0
-        #     x = local_data[idx_start:end_idx].to(device)
-        #     y = local_label[idx_start:end_idx].to(device)
-        #     idx_start = end_idx
 
         if sample_type == 'round_robin':
             # take the next batch of size `batch_size`, wrapping around the dataset
