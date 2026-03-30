@@ -9,7 +9,7 @@ Below is a sample **README** for this code base. It contains an overview of the 
 This repository implements a variety of distributed/federated learning paradigms with *non-IID* data distribution, including:
 
 - **Federated Learning** (`fedsgd`): A traditional server-based approach where a global parameter server averages updates from the nodes (spokes).
-- **EL Oracle** (`p2p`): A peer-to-peer method using a *centrally constructed* \(k\)-regular mixing graph.
+- **Peer-to-Peer** (`p2p`): Decentralized baselines - Exponential Graph, BaseGraph, Erdos-Renyi, k-redular.
 - **EL Local** (`p2p_local`): A truly distributed peer-to-peer method where each node randomly picks \(k\) neighbors per round (without a global graph).
 - **Hubs-and-Spokes Learning** (`hsl`): A three-step process involving multiple hubs and spokes exchanging their models in different stages.
 
@@ -66,15 +66,15 @@ python main.py [options]
 
 | **Argument**  | **Type** | **Description**                                                                                                   |
 |---------------|----------|-------------------------------------------------------------------------------------------------------------------|
-| `--k`         | `int`    | - **EL Oracle** (`p2p`) uses a centrally generated \(k\)-regular graph.  <br>- **EL Local** (`p2p_local`) each node chooses \(k\) neighbors. |
+| `--k`         | `int`    | - **P2P** (`p2p`) uses a centrally generated \(k\)-regular graph.  <br>- **EL Local** (`p2p_local`) each node chooses \(k\) neighbors. |
 
 #### Hubs-and-Spokes (HSL) Arguments
 
 | **Argument**  | **Type** | **Description**                                                                                                                                                                                              |
 |---------------|----------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `--b_hs`      | `int`    | **Stage 1**: Each hub randomly selects `b_hs` spokes and averages them. (Hub “indegree” from spokes)                                                                                                         |
-| `--b_hh`      | `int`    | **Stage 2**: Hubs mix with each other using an “EL Local” style aggregator with outdegree = `b_hh`.                                                                                                         |
-| `--b_sh`      | `int`    | **Stage 3**: Each spoke randomly selects `b_sh` hubs to average (Spoke “indegree” from hubs).                                                                                                               |
+| `--b_lr`      | `int`    | **Stage 1**: Each hub randomly selects `b_lr` spokes and averages them. (Hub “indegree” from spokes)                                                                                                         |
+| `--b_rr`      | `int`    | **Stage 2**: Hubs mix with each other using an “EL Local” style aggregator with outdegree = `b_rr`.                                                                                                         |
+| `--b_rl`      | `int`    | **Stage 3**: Each spoke randomly selects `b_rl` hubs to average (Spoke “indegree” from hubs).                                                                                                               |
 
 ### **store_true** Arguments
 
@@ -108,16 +108,16 @@ Below are example commands showing how to run the different modes:
    ```
    This runs standard federated averaging on MNIST with 10 spokes, using CPU (`--gpu -1`) for 50 rounds.
 
-2. **EL Oracle (P2P / `p2p`):**
+2. ** (P2P / `p2p`):**
    ```bash
    python main.py \
        --exp p2p_mnist \
        --dataset mnist \
        --aggregation p2p \
-       --k 2 \
+       --topo exponential \
        --num_spokes 10 \
        --num_rounds 50 \
-       --num_local_iters 1 \
+       --num_local_iters 5 \
        --batch_size 32 \
        --eval_time 5 \
        --gpu 0 \
@@ -145,17 +145,17 @@ Below are example commands showing how to run the different modes:
    ```
    - **EL Local** has each node choose `k=3` random neighbors (plus itself) every round, with no global coordinator.
 
-4. **HSL (Hubs-and-Spokes Learning / `hsl`):**
+4. **TGL (Tiered Gossip Learning / `hsl`):**
    ```bash
    python main.py \
        --exp hsl_cifar \
        --dataset cifar10 \
        --aggregation hsl \
-       --num_spokes 12 \
-       --num_hubs 3 \
-       --b_hs 2 \
-       --b_hh 1 \
-       --b_sh 2 \
+       --num_leaves 12 \
+       --num_relays 3 \
+       --b_lr 2 \
+       --b_rr 1 \
+       --b_rl 2 \
        --num_rounds 80 \
        --num_local_iters 2 \
        --batch_size 64 \
@@ -165,9 +165,9 @@ Below are example commands showing how to run the different modes:
        --bias 0.4
    ```
    Here, each round has:
-   1. **Stage 1** (`b_hs=2`): Hubs each pick 2 spokes.
-   2. **Stage 2** (`b_hh=1`): Hubs mix among themselves (each picks 1 hub).
-   3. **Stage 3** (`b_sh=2`): Spokes each pick 2 hubs to update from.
+   1. **Stage 1** (`b_hs=2`): Relays each pick 2 spokes.
+   2. **Stage 2** (`b_hh=1`): Relays mix among themselves (each picks 1 relay).
+   3. **Stage 3** (`b_sh=2`): Leaves each pick 2 relays to update from.
 
 ---
 
@@ -180,7 +180,7 @@ Below are example commands showing how to run the different modes:
   python main.py \
       --exp sim_p2p \
       --aggregation p2p_local \
-      --num_spokes 10 \
+      --num_leaves 10 \
       --k 2 \
       --num_rounds 30 \
       --graph_simulation_only
@@ -189,7 +189,7 @@ Below are example commands showing how to run the different modes:
 
 - **Reproducibility**: You can fix a seed for data partitioning and model initialization using `--seed <positive_int>`. For example:
   ```bash
-  python main.py --seed 123 --aggregation p2p --k 2 ...
+  python main.py --seed 108 --aggregation p2p --k 2 ...
   ```
 
 - **Output Files**:  
