@@ -36,7 +36,7 @@ def parse_args():
                         choices=['fedsgd', 'p2p', 'p2p_local', 'tgl'],
                         help='Aggregation protocol to use.')
     parser.add_argument("--topo", type=str, default=None,
-                        choices=['ring', 'torus', 'erdos-renyi', 'base-graph', 'simple-base-graph', 'exponential'],
+                        choices=['ring', 'torus', 'erdos-renyi', 'base-graph', 'simple-base-graph', 'exponential', 'hsl'],
                         help='Topology to use for p2p graphs.')
     parser.add_argument("--budget", type=int, default=None,
                         help='Number of edges in an undirected p2p graph '
@@ -86,6 +86,14 @@ def parse_args():
     parser.add_argument("--num_workers", type=int, default=0,
                     help="Number of parallel workers for P2P evaluation. 0 = Sequential (default).")
 
+    # hsl (hub-spoke-local) parameters — used when --topo hsl
+    parser.add_argument("--hub_degree", type=int, default=None,
+                        help='Out-degree for hub nodes in hsl topology. '
+                             'If None, computed from b_lr, b_rr, b_rl, num_relays, num_leaves.')
+    parser.add_argument("--spoke_degree", type=int, default=None,
+                        help='Out-degree for spoke nodes in hsl topology. '
+                             'If None, computed from b_lr, b_rl, num_relays, num_leaves.')
+                             
     return parser.parse_args()
 
 
@@ -252,7 +260,37 @@ def main(args):
             W_simple_base = graph.w_list
         elif args.topo == 'exponential':
             W = utils.create_exponential_graph(args.num_leaves, aggregator_device)
+        elif args.topo == 'hsl':
+            # Compute default degrees from TGL parameters
+            n_l, n_r = args.num_leaves, args.num_relays
+            default_hub_degree   = int(math.ceil(max(
+                args.b_lr + args.b_rr,
+                args.b_rr + n_l * args.b_rl / n_r
+            )))
+            default_spoke_degree = int(math.ceil(max(
+                n_r * args.b_lr / n_l,
+                args.b_rl
+            )))
+            hub_degree   = args.hub_degree   if args.hub_degree   is not None else default_hub_degree
+            spoke_degree = args.spoke_degree if args.spoke_degree is not None else default_spoke_degree
 
+            tgl_edges  = n_r * args.b_lr + n_r * args.b_rr + n_l * args.b_rl
+            hsl_edges  = n_r * hub_degree + (n_l - n_r) * spoke_degree
+
+            print(f"[HSL] Default hub_degree={default_hub_degree}  "
+                  f"spoke_degree={default_spoke_degree}")
+            if args.hub_degree is not None or args.spoke_degree is not None:
+                print(f"[HSL] Overridden hub_degree={hub_degree}  "
+                      f"spoke_degree={spoke_degree}")
+            print(f"[HSL] Total directed edges => HSL: {hsl_edges}  "
+                  f"TGL reference: {tgl_edges}")
+
+            # Fix hub indices for the entire run using the same seed
+            torch.manual_seed(args.seed)
+            hub_perm    = torch.randperm(args.num_leaves)
+            hub_indices   = hub_perm[:n_r].tolist()
+            spoke_indices = hub_perm[n_r:].tolist()
+            print(f"[HSL] Hub nodes (first {n_r}): {sorted(hub_indices)}")
         try:    
             for rnd in range(args.num_rounds):
                 # Step 2: Each leaf trains locally and returns updated weights
@@ -293,22 +331,33 @@ def main(args):
 
                 elif args.aggregation == 'p2p':
                     # Create adjacency matrix based on the chosen topology
-                    if args.topo == 'ring':
-                        W = utils.create_ring_graph(args.num_leaves, aggregator_device)
-                    elif args.topo == 'torus':
-                        W = utils.create_torus_graph(args.num_leaves, aggregator_device)
-                    elif args.topo == 'erdos-renyi':
-                        W = utils.create_erdos_renyi_graph(args.num_leaves, args.budget, aggregator_device)
-                    elif args.topo == 'base-graph':
-                        W = W_base[rnd % len(W_base)].cuda()
-                    elif args.topo == 'simple-base-graph': 
-                        W = W_simple_base[rnd % len(W_simple_base)].cuda()
-                    else:
-                        W = utils.create_k_random_regular_graph(args.num_leaves, args.k, aggregator_device)
+                    if args.topo == 'hsl':
+                        # Full aggregation handled internally — no W construction needed
+                        node_states, W = aggregation.hsl_aggregation(
+                            node_states,
+                            hub_indices, spoke_indices,
+                            hub_degree, spoke_degree,
+                            return_W=True
+                        )
+                        node_states = node_states.detach()
+                    else: 
+                        if args.topo == 'ring':
+                            W = utils.create_ring_graph(args.num_leaves, aggregator_device)
+                        elif args.topo == 'torus':
+                            W = utils.create_torus_graph(args.num_leaves, aggregator_device)
+                        elif args.topo == 'erdos-renyi':
+                            W = utils.create_erdos_renyi_graph(args.num_leaves, args.budget, aggregator_device)
+                        elif args.topo == 'base-graph':
+                            W = W_base[rnd % len(W_base)].cuda()
+                        elif args.topo == 'simple-base-graph': 
+                            W = W_simple_base[rnd % len(W_simple_base)].cuda()
+                        
+                        else:
+                            W = utils.create_k_random_regular_graph(args.num_leaves, args.k, aggregator_device)
 
-                    # Perform p2p averaging
-                    node_states = aggregation.p2p_aggregation(node_states, W)
-                    node_states = node_states.detach()
+                        # Perform p2p averaging
+                        node_states = aggregation.p2p_aggregation(node_states, W)
+                        node_states = node_states.detach()
 
                     # (Optional) Log node degrees if requested
                     if args.monitor_degree:

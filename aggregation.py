@@ -66,7 +66,49 @@ def p2p_local_aggregation(node_wts, outdegree, return_W=False, alive_mask=None):
         return updated_wts, W
     else:
         return updated_wts
-        
+
+def hsl_aggregation(node_wts, hub_indices, spoke_indices,
+                    hub_degree, spoke_degree, return_W=False):
+    """
+    Asymmetric-degree gossip (Hub-Spoke-Local).
+
+    hub_indices  : list or 1-D tensor of hub node indices (fixed, chosen once)
+    spoke_indices: list or 1-D tensor of spoke node indices
+    hub_degree   : int  — out-degree for hub nodes (excluding self)
+    spoke_degree : int  — out-degree for spoke nodes (excluding self)
+
+    Sampling is identical to p2p_local_aggregation: random without replacement
+    from ALL nodes excluding self.  Self-loop always included.  Row-stochastic.
+    """
+    num_nodes = node_wts.shape[0]
+    device    = node_wts.device
+
+    W = torch.zeros((num_nodes, num_nodes), device=device)
+    all_nodes = torch.arange(num_nodes, device=device)
+
+    for i in hub_indices:
+        pool   = all_nodes[all_nodes != i]
+        degree = min(hub_degree, pool.size(0))
+        chosen = pool[torch.randperm(pool.size(0), device=device)[:degree]]
+        W[i, i]      = 1.0
+        W[i, chosen] = 1.0
+
+    for i in spoke_indices:
+        pool   = all_nodes[all_nodes != i]
+        degree = min(spoke_degree, pool.size(0))
+        chosen = pool[torch.randperm(pool.size(0), device=device)[:degree]]
+        W[i, i]      = 1.0
+        W[i, chosen] = 1.0
+
+    row_sums = W.sum(dim=1, keepdim=True)
+    W = W / (row_sums + 1e-10)
+
+    updated_wts = torch.mm(W, node_wts)
+
+    if return_W:
+        return updated_wts, W
+    return updated_wts
+            
 def old_p2p_local_aggregation(node_wts, outdegree, return_W=False, alive_mask=None):
     """
     node_wts: shape [num_nodes, dim]
