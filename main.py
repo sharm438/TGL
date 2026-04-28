@@ -68,11 +68,11 @@ def parse_args():
                         help='Random seed. If 0 or negative, uses a random seed.')
 
     # tgl parameters
-    parser.add_argument("--b_rl", type=int, default=2,
+    parser.add_argument("--b_lr", type=int, default=2,
                         help='Max leaf connections per relay in stage 1.')
     parser.add_argument("--b_rr", type=int, default=1,
                         help='Max neighbor connections per relay in stage 2.')
-    parser.add_argument("--b_lr", type=int, default=2,
+    parser.add_argument("--b_rl", type=int, default=2,
                         help='Max relay connections per leaf in stage 3.')
 
     # Monitoring flags
@@ -406,10 +406,10 @@ def main(args):
                     # Stage 1: leaves -> relays
                     stage1_matrix = torch.zeros((args.num_relays, args.num_leaves), device=aggregator_device)
                     for relay_id in range(args.num_relays):
-                        if args.b_rl <= args.num_leaves:
-                            chosen_leaf_ids = torch.randperm(args.num_leaves, device=aggregator_device)[:args.b_rl]
+                        if args.b_lr <= args.num_leaves:
+                            chosen_leaf_ids = torch.randperm(args.num_leaves, device=aggregator_device)[:args.b_lr]
                         else:
-                            chosen_leaf_ids = torch.randint(0, args.num_leaves, (args.b_rl,), device=aggregator_device)
+                            chosen_leaf_ids = torch.randint(0, args.num_leaves, (args.b_lr,), device=aggregator_device)
                         for s_id in chosen_leaf_ids:
                             stage1_matrix[relay_id, s_id] = 1.0
                     # Row-normalize
@@ -432,10 +432,10 @@ def main(args):
                     # Stage 3: relays -> leaves
                     stage3_matrix = torch.zeros((args.num_leaves, args.num_relays), device=aggregator_device)
                     for leaf_id in range(args.num_leaves):
-                        if args.b_lr <= args.num_relays:
-                            chosen_relay_ids = torch.randperm(args.num_relays, device=aggregator_device)[:args.b_lr]
+                        if args.b_rl <= args.num_relays:
+                            chosen_relay_ids = torch.randperm(args.num_relays, device=aggregator_device)[:args.b_rl]
                         else:
-                            chosen_relay_ids = torch.randint(0, args.num_relays, (args.b_lr,), device=aggregator_device)
+                            chosen_relay_ids = torch.randint(0, args.num_relays, (args.b_rl,), device=aggregator_device)
                         for h_id in chosen_relay_ids:
                             stage3_matrix[leaf_id, h_id] = 1.0
                     # Row-normalize
@@ -583,10 +583,10 @@ def main(args):
                 # Stage 1: leaves->relays
                 stage1_matrix = torch.zeros((args.num_relays, args.num_leaves), device=aggregator_device)
                 for relay_id in range(args.num_relays):
-                    if args.b_rl <= args.num_leaves:
-                        chosen_leaf_ids = torch.randperm(args.num_leaves, device=aggregator_device)[:args.b_rl]
+                    if args.b_lr <= args.num_leaves:
+                        chosen_leaf_ids = torch.randperm(args.num_leaves, device=aggregator_device)[:args.b_lr]
                     else:
-                        chosen_leaf_ids = torch.randint(0, args.num_leaves, (args.b_rl,), device=aggregator_device)
+                        chosen_leaf_ids = torch.randint(0, args.num_leaves, (args.b_lr,), device=aggregator_device)
                     for s_id in chosen_leaf_ids:
                         stage1_matrix[relay_id, s_id] = 1.0
                 for row_i in range(args.num_relays):
@@ -603,10 +603,10 @@ def main(args):
                 # Stage 3: relays->leaves
                 stage3_matrix = torch.zeros((args.num_leaves, args.num_relays), device=aggregator_device)
                 for leaf_id in range(args.num_leaves):
-                    if args.b_lr <= args.num_relays:
-                        chosen_relay_ids = torch.randperm(args.num_relays, device=aggregator_device)[:args.b_lr]
+                    if args.b_rl <= args.num_relays:
+                        chosen_relay_ids = torch.randperm(args.num_relays, device=aggregator_device)[:args.b_rl]
                     else:
-                        chosen_relay_ids = torch.randint(0, args.num_relays, (args.b_lr,), device=aggregator_device)
+                        chosen_relay_ids = torch.randint(0, args.num_relays, (args.b_rl,), device=aggregator_device)
                     for h_id in chosen_relay_ids:
                         stage3_matrix[leaf_id, h_id] = 1.0
                 for row_i in range(args.num_leaves):
