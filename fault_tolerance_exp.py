@@ -8,9 +8,9 @@ Fault model (no compensation):
     uniformly at random and marked as crashed for that round only.
 
   Stage 1 (leaf -> relay):
-    Each relay samples exactly b_rl leaves via torch.randperm, identical to
+    Each relay samples exactly b_lr leaves via torch.randperm, identical to
     main.py. Crashed leaves in the sampled set are silently dropped. The relay
-    averages only the survivors. If all b_rl sampled leaves are crashed, the
+    averages only the survivors. If all b_lr sampled leaves are crashed, the
     relay retains its own current model unchanged.
 
   Stage 2 (relay <-> relay):
@@ -19,9 +19,9 @@ Fault model (no compensation):
     restored to the pre-gossip state — they neither sent nor received anything.
 
   Stage 3 (relay -> leaf):
-    Each leaf samples exactly b_lr relays via torch.randperm, identical to
+    Each leaf samples exactly b_rl relays via torch.randperm, identical to
     main.py. Crashed relays in the sampled set are silently dropped. The leaf
-    averages only the survivors. If all b_lr sampled relays are crashed, the
+    averages only the survivors. If all b_rl sampled relays are crashed, the
     leaf retains its own current model unchanged.
 
   Leaf crash mode:
@@ -33,7 +33,7 @@ Crashes are resampled independently every round (dynamic / transient).
 Usage:
     python fault_tolerance_exp.py \
         --dataset cifar10 --num_leaves 100 \
-        --num_relays 20 --b_rl 15 --b_rr 10 --b_lr 2 \
+        --num_relays 20 --b_lr 15 --b_rr 10 --b_rl 2 \
         --crash_type relay --crash_rate 20 \
         --lr 0.1 --bias 0.1 --num_local_iters 5 \
         --num_rounds 1000 --eval_time 10 --num_workers 10 \
@@ -74,9 +74,9 @@ def parse_args():
     # TGL topology
     parser.add_argument("--num_leaves",  type=int, default=100)
     parser.add_argument("--num_relays",  type=int, default=20)
-    parser.add_argument("--b_rl", type=int, default=15)
+    parser.add_argument("--b_lr", type=int, default=15)
     parser.add_argument("--b_rr", type=int, default=10)
-    parser.add_argument("--b_lr", type=int, default=2)
+    parser.add_argument("--b_rl", type=int, default=2)
 
     # Fault injection
     parser.add_argument("--crash_type", type=str, default="relay",
@@ -274,12 +274,12 @@ def main():
 
             for relay_id in range(args.num_relays):
                 # Identical sampling to main.py
-                if args.b_rl <= args.num_leaves:
+                if args.b_lr <= args.num_leaves:
                     sampled_leaf_ids = torch.randperm(
-                        args.num_leaves, device=aggregator_device)[:args.b_rl]
+                        args.num_leaves, device=aggregator_device)[:args.b_lr]
                 else:
                     sampled_leaf_ids = torch.randint(
-                        0, args.num_leaves, (args.b_rl,), device=aggregator_device)
+                        0, args.num_leaves, (args.b_lr,), device=aggregator_device)
 
                 # Drop crashed leaves from the sampled set — no resampling
                 alive_sampled = [int(l) for l in sampled_leaf_ids
@@ -330,12 +330,12 @@ def main():
 
             for leaf_id in range(args.num_leaves):
                 # Identical sampling to main.py
-                if args.b_lr <= args.num_relays:
+                if args.b_rl <= args.num_relays:
                     sampled_relay_ids = torch.randperm(
-                        args.num_relays, device=aggregator_device)[:args.b_lr]
+                        args.num_relays, device=aggregator_device)[:args.b_rl]
                 else:
                     sampled_relay_ids = torch.randint(
-                        0, args.num_relays, (args.b_lr,), device=aggregator_device)
+                        0, args.num_relays, (args.b_rl,), device=aggregator_device)
 
                 # Drop crashed relays from the sampled set — no resampling
                 alive_sampled = [int(r) for r in sampled_relay_ids
