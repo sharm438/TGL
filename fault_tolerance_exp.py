@@ -3,41 +3,54 @@ fault_tolerance_exp.py
 ----------------------
 TGL training with dynamic node failures. Mirrors main.py exactly.
 
-Fault model (no compensation):
+Fault model (clean, no contamination):
   - At the start of each round, crash_rate% of relays (or leaves) are sampled
     uniformly at random and marked as crashed for that round only.
 
   Stage 1 (leaf -> relay):
-    Each relay samples exactly b_lr leaves via torch.randperm, identical to
-    main.py. Crashed leaves in the sampled set are silently dropped. The relay
-    averages only the survivors. If all b_lr sampled leaves are crashed, the
-    relay retains its own current model unchanged.
+    Crashed relays do NOT sample leaves and do NOT update their model.
+    Their relay_states entry is frozen at its previous value.
+    Alive relays sample exactly b_lr leaves via torch.randperm over all
+    num_leaves (identical to main.py). Crashed leaves in the sampled set
+    are silently dropped. The relay averages only the alive survivors.
+    If all b_lr sampled leaves happen to be crashed, the relay keeps its
+    own current model. We track how many alive relays had 0 alive leaves
+    in their sample (leaf_outdeg0_count per round).
 
   Stage 2 (relay <-> relay):
-    p2p_local_aggregation is called on the full relay_states tensor, identical
-    to main.py. After the result is returned, crashed relays have their rows
-    restored to the pre-gossip state — they neither sent nor received anything.
+    Gossip runs only on the alive relay sub-tensor. Each alive relay
+    samples b_rr peers from the alive relay pool only (clipped if
+    fewer alive relays exist — unavoidable arithmetic). Crashed relays
+    are completely excluded — they neither send nor receive. Their
+    relay_states entry is unchanged.
 
   Stage 3 (relay -> leaf):
-    Each leaf samples exactly b_rl relays via torch.randperm, identical to
-    main.py. Crashed relays in the sampled set are silently dropped. The leaf
-    averages only the survivors. If all b_rl sampled relays are crashed, the
-    leaf retains its own current model unchanged.
+    Each leaf samples exactly b_rl relays via torch.randperm over all
+    num_relays (identical to main.py). Crashed relays in the sampled
+    set are silently dropped. The leaf averages only the alive survivors.
+    If all b_rl sampled relays are crashed, the leaf keeps its own
+    post-training model from this round's local SGD. We track how many
+    leaves had 0 alive relays in their sample (relay_indeg0_count per
+    round).
 
   Leaf crash mode:
-    Crashed leaves skip local training (stale model carried over) and are
-    excluded from Stage 1 sampling — relays cannot pull from a crashed leaf.
+    Crashed leaves skip local training (stale model carried over) and
+    are excluded from the Stage 1 sampling pool.
 
 Crashes are resampled independently every round (dynamic / transient).
 
+At the end of training, we print:
+  - Average fraction of alive relays with 0 alive leaves sampled (Stage 1)
+  - Average fraction of leaves with 0 alive relays sampled (Stage 3)
+
 Usage:
-    python fault_tolerance_exp.py \
-        --dataset cifar10 --num_leaves 100 \
-        --num_relays 20 --b_lr 15 --b_rr 10 --b_rl 2 \
-        --crash_type relay --crash_rate 20 \
-        --lr 0.1 --bias 0.1 --num_local_iters 5 \
-        --num_rounds 1000 --eval_time 10 --num_workers 10 \
-        --monitor_model_drift --gpu 0 --seed 108 \
+    python fault_tolerance_exp.py \\
+        --dataset cifar10 --num_leaves 100 \\
+        --num_relays 20 --b_lr 15 --b_rr 10 --b_rl 2 \\
+        --crash_type relay --crash_rate 20 \\
+        --lr 0.1 --bias 0.1 --num_local_iters 5 \\
+        --num_rounds 1000 --eval_time 10 --num_workers 10 \\
+        --monitor_model_drift --gpu 0 --seed 108 \\
         --exp ft_relay20_cifar10_s100h20
 """
 
@@ -69,22 +82,25 @@ def parse_args():
     parser.add_argument("--dataset", type=str, default="cifar10",
                         choices=["mnist", "cifar10", "femnist", "agnews"])
     parser.add_argument("--fraction", type=float, default=1.0)
-    parser.add_argument("--bias", type=float, default=0.1)
+    parser.add_argument("--bias",     type=float, default=0.1)
 
     # TGL topology
-    parser.add_argument("--num_leaves",  type=int, default=100)
-    parser.add_argument("--num_relays",  type=int, default=20)
-    parser.add_argument("--b_lr", type=int, default=15)
-    parser.add_argument("--b_rr", type=int, default=10)
-    parser.add_argument("--b_rl", type=int, default=2)
+    parser.add_argument("--num_leaves", type=int, default=100)
+    parser.add_argument("--num_relays", type=int, default=20)
+    parser.add_argument("--b_lr", type=int, default=15,
+                        help="Max leaves sampled per relay in Stage 1.")
+    parser.add_argument("--b_rr", type=int, default=10,
+                        help="Max relay neighbours in Stage 2.")
+    parser.add_argument("--b_rl", type=int, default=2,
+                        help="Max relays sampled per leaf in Stage 3.")
 
     # Fault injection
     parser.add_argument("--crash_type", type=str, default="relay",
                         choices=["relay", "leaf"])
     parser.add_argument("--crash_rate", type=float, default=0.0,
-                        help="Percentage of nodes crashed per round (0-100)")
+                        help="Percentage of nodes crashed per round (0-100).")
 
-    # Training — identical defaults to main.py paper configs
+    # Training — identical to main.py
     parser.add_argument("--num_rounds",      type=int,   default=1000)
     parser.add_argument("--num_local_iters", type=int,   default=5)
     parser.add_argument("--batch_size",      type=int,   default=None)
@@ -118,7 +134,8 @@ def main():
         print(f"[Info] Using fixed seed={args.seed}")
 
     aggregator_device = torch.device(
-        f"cuda:{args.gpu}" if args.gpu >= 0 and torch.cuda.is_available() else "cpu"
+        f"cuda:{args.gpu}" if args.gpu >= 0 and torch.cuda.is_available()
+        else "cpu"
     )
 
     os.makedirs("outputs", exist_ok=True)
@@ -202,13 +219,19 @@ def main():
         metrics["pre_drift"]  = []
         metrics["post_drift"] = []
 
-    # ---- How many nodes crash per round
+    # ---- Crash count --------------------------------------------------------
     n_total = args.num_relays if args.crash_type == "relay" else args.num_leaves
     n_crash = max(0, int(math.floor(n_total * args.crash_rate / 100.0)))
 
     print(f"[Info] crash_type={args.crash_type}  "
           f"crash_rate={args.crash_rate:.0f}%  "
           f"n_crash={n_crash}/{n_total} per round")
+
+    # ---- Degree-zero trackers -----------------------------------------------
+    # For relay crash: track alive relays with 0 alive leaves (Stage 1)
+    #                  and leaves with 0 alive relays (Stage 3)
+    relay_s1_zero_counts = []   # per round: # alive relays with 0 alive leaves
+    leaf_s3_zero_counts  = []   # per round: # leaves with 0 alive relays
 
     # ---- Model drift helper (identical to main.py) --------------------------
     def compute_model_drift(stack):
@@ -223,21 +246,25 @@ def main():
     try:
         for rnd in range(args.num_rounds):
 
-            # --- Sample crashed nodes for this round -------------------------
+            # --- Sample crashed nodes ----------------------------------------
             if args.crash_type == "relay":
-                crashed_relays = set(random.sample(range(args.num_relays), n_crash)) \
-                                 if n_crash > 0 else set()
+                crashed_relays = set(
+                    random.sample(range(args.num_relays), n_crash)
+                ) if n_crash > 0 else set()
                 crashed_leaves = set()
             else:
                 crashed_relays = set()
-                crashed_leaves = set(random.sample(range(args.num_leaves), n_crash)) \
-                                 if n_crash > 0 else set()
+                crashed_leaves = set(
+                    random.sample(range(args.num_leaves), n_crash)
+                ) if n_crash > 0 else set()
 
+            alive_relays = [r for r in range(args.num_relays)
+                            if r not in crashed_relays]
             alive_leaves = [l for l in range(args.num_leaves)
                             if l not in crashed_leaves]
 
             # -----------------------------------------------------------------
-            # Local training — alive leaves only (identical to main.py 259-273)
+            # Local training — alive leaves only (identical to main.py)
             # -----------------------------------------------------------------
             for node_id in alive_leaves:
                 start_wts = node_states[node_id].detach().clone()
@@ -255,119 +282,103 @@ def main():
                 )
                 node_states[node_id] = updated_wts.detach()
 
-            # Pre-aggregation drift (identical to main.py 275-278)
+            # Pre-aggregation drift
             if args.monitor_model_drift and (rnd + 1) % args.eval_time == 0:
                 metrics["pre_drift"].append(compute_model_drift(node_states))
 
             # =================================================================
-            # TGL aggregation with fault injection
-            # Sampling is IDENTICAL to main.py — torch.randperm over the full
-            # index set. Crashed nodes in the sample are dropped silently.
-            # No resampling, no compensation.
+            # Stage 1: leaf -> relay
+            # Crashed relays are completely skipped — they do not sample,
+            # do not update. Alive relays sample b_lr leaves from the full
+            # pool (identical to main.py) then drop crashed leaves silently.
             # =================================================================
+            rnd_relay_s1_zeros = 0
 
-            # -----------------------------------------------------------------
-            # Stage 1: leaves -> relays (mirrors main.py lines 357-376)
-            # -----------------------------------------------------------------
-            stage1_matrix = torch.zeros(
-                (args.num_relays, args.num_leaves), device=aggregator_device)
-
-            for relay_id in range(args.num_relays):
-                # Identical sampling to main.py
+            for relay_id in alive_relays:
+                # Sample identical to main.py
                 if args.b_lr <= args.num_leaves:
-                    sampled_leaf_ids = torch.randperm(
-                        args.num_leaves, device=aggregator_device)[:args.b_lr]
+                    sampled = torch.randperm(
+                        args.num_leaves,
+                        device=aggregator_device)[:args.b_lr]
                 else:
-                    sampled_leaf_ids = torch.randint(
-                        0, args.num_leaves, (args.b_lr,), device=aggregator_device)
+                    sampled = torch.randint(
+                        0, args.num_leaves,
+                        (args.b_lr,), device=aggregator_device)
 
-                # Drop crashed leaves from the sampled set — no resampling
-                alive_sampled = [int(l) for l in sampled_leaf_ids
+                # Drop crashed leaves — no resampling
+                alive_sampled = [int(l) for l in sampled
                                  if int(l) not in crashed_leaves]
 
                 if len(alive_sampled) == 0:
-                    # All sampled leaves crashed: relay keeps its own model
-                    # (stage1_matrix row stays zero → no update applied below)
-                    pass
+                    # Relay keeps its own current model — nothing written
+                    rnd_relay_s1_zeros += 1
                 else:
-                    for s_id in alive_sampled:
-                        stage1_matrix[relay_id, s_id] = 1.0
+                    chosen = torch.tensor(
+                        alive_sampled, device=aggregator_device)
+                    relay_states[relay_id] = \
+                        node_states[chosen].mean(dim=0).detach()
+            # crashed relays: relay_states[relay_id] frozen — not touched
 
-            # Row-normalise (identical to main.py)
-            for relay_id in range(args.num_relays):
-                row_sum = torch.sum(stage1_matrix[relay_id])
-                if row_sum > 0:
-                    stage1_matrix[relay_id] /= row_sum
+            relay_s1_zero_counts.append(rnd_relay_s1_zeros)
 
-            # Apply Stage 1 (identical to main.py 373-376)
-            for relay_id in range(args.num_relays):
-                indices = (stage1_matrix[relay_id] > 0).nonzero(as_tuple=True)[0]
-                if len(indices) > 0:
-                    relay_states[relay_id] = node_states[indices].mean(dim=0).detach()
-                # else: relay had no alive sampled leaves → keeps its own model
+            # =================================================================
+            # Stage 2: relay <-> relay gossip
+            # Run p2p_local_aggregation ONLY on the alive relay sub-tensor.
+            # Crashed relays are completely excluded — they are not in the
+            # pool, cannot be sampled, and their state is untouched.
+            # =================================================================
+            if len(alive_relays) > 1:
+                alive_relay_tensor = relay_states[alive_relays]
+                # Clip b_rr to alive pool — unavoidable arithmetic only
+                effective_b_rr = min(args.b_rr, len(alive_relays) - 1)
+                updated_alive, _ = aggregation.p2p_local_aggregation(
+                    alive_relay_tensor, effective_b_rr, return_W=True)
+                updated_alive = updated_alive.detach()
+                for idx, relay_id in enumerate(alive_relays):
+                    relay_states[relay_id] = updated_alive[idx]
+            # If only 1 alive relay: no gossip, state unchanged
+            # crashed relays: relay_states[relay_id] still frozen
 
-            # -----------------------------------------------------------------
-            # Stage 2: relay gossip (mirrors main.py lines 378-382)
-            # Call p2p_local_aggregation on the FULL relay tensor — identical
-            # to main.py. Then restore crashed relays to their pre-gossip state
-            # so they neither contributed nor received anything.
-            # -----------------------------------------------------------------
-            pre_gossip_relay_states = relay_states.clone()
-
-            relay_states, stage2_matrix = aggregation.p2p_local_aggregation(
-                relay_states, args.b_rr, return_W=True)
-            relay_states = relay_states.detach()
-
-            # Restore crashed relays — they did not participate
-            for relay_id in crashed_relays:
-                relay_states[relay_id] = pre_gossip_relay_states[relay_id]
-
-            # -----------------------------------------------------------------
-            # Stage 3: relays -> leaves (mirrors main.py lines 383-402)
-            # -----------------------------------------------------------------
-            stage3_matrix = torch.zeros(
-                (args.num_leaves, args.num_relays), device=aggregator_device)
+            # =================================================================
+            # Stage 3: relay -> leaf
+            # Each leaf samples b_rl relays from the full pool (identical to
+            # main.py) then drops crashed relays silently. If all sampled
+            # relays are crashed, leaf keeps its own post-training model.
+            # =================================================================
+            rnd_leaf_s3_zeros = 0
 
             for leaf_id in range(args.num_leaves):
-                # Identical sampling to main.py
+                # Sample identical to main.py
                 if args.b_rl <= args.num_relays:
-                    sampled_relay_ids = torch.randperm(
-                        args.num_relays, device=aggregator_device)[:args.b_rl]
+                    sampled = torch.randperm(
+                        args.num_relays,
+                        device=aggregator_device)[:args.b_rl]
                 else:
-                    sampled_relay_ids = torch.randint(
-                        0, args.num_relays, (args.b_rl,), device=aggregator_device)
+                    sampled = torch.randint(
+                        0, args.num_relays,
+                        (args.b_rl,), device=aggregator_device)
 
-                # Drop crashed relays from the sampled set — no resampling
-                alive_sampled = [int(r) for r in sampled_relay_ids
+                # Drop crashed relays — no resampling
+                alive_sampled = [int(r) for r in sampled
                                  if int(r) not in crashed_relays]
 
                 if len(alive_sampled) == 0:
-                    # All sampled relays crashed: leaf keeps its own model
-                    # (stage3_matrix row stays zero → no update applied below)
-                    pass
+                    # Leaf keeps its own post-training model — nothing written
+                    rnd_leaf_s3_zeros += 1
                 else:
-                    for h_id in alive_sampled:
-                        stage3_matrix[leaf_id, h_id] = 1.0
+                    chosen = torch.tensor(
+                        alive_sampled, device=aggregator_device)
+                    node_states[leaf_id] = \
+                        relay_states[chosen].mean(dim=0).detach()
 
-            # Row-normalise
-            for leaf_id in range(args.num_leaves):
-                row_sum = torch.sum(stage3_matrix[leaf_id])
-                if row_sum > 0:
-                    stage3_matrix[leaf_id] /= row_sum
+            leaf_s3_zero_counts.append(rnd_leaf_s3_zeros)
 
-            # Apply Stage 3 (identical to main.py 399-402)
-            for leaf_id in range(args.num_leaves):
-                indices = (stage3_matrix[leaf_id] > 0).nonzero(as_tuple=True)[0]
-                if len(indices) > 0:
-                    node_states[leaf_id] = relay_states[indices].mean(dim=0).detach()
-                # else: leaf had no alive sampled relays → keeps its own model
-
-            # Post-aggregation drift (identical to main.py 418-420)
+            # Post-aggregation drift
             if args.monitor_model_drift and (rnd + 1) % args.eval_time == 0:
                 metrics["post_drift"].append(compute_model_drift(node_states))
 
             # -----------------------------------------------------------------
-            # Evaluation (identical to main.py 422-459 p2p parallel branch)
+            # Evaluation (identical to main.py parallel branch)
             # -----------------------------------------------------------------
             if (rnd + 1) % args.eval_time == 0:
                 metrics["n_crashed"].append(n_crash)
@@ -385,7 +396,9 @@ def main():
                     print(f"[Round {rnd+1}] TGL crash={args.crash_rate:.0f}% "
                           f"({args.crash_type}) => "
                           f"Acc range: [{min(g_accs):.4f}, {max(g_accs):.4f}]  "
-                          f"Crashed: {n_crash}/{n_total}")
+                          f"Crashed: {n_crash}/{n_total}  "
+                          f"S1-zeros: {rnd_relay_s1_zeros}  "
+                          f"S3-zeros: {rnd_leaf_s3_zeros}")
                 else:
                     utils.evaluate_and_log(
                         current_round=rnd + 1,
@@ -394,13 +407,45 @@ def main():
                         mode="p2p",
                         test_data=test_data,
                         device=aggregator_device,
-                        net_name=net_name, inp_dim=inp_dim, out_dim=out_dim,
+                        net_name=net_name,
+                        inp_dim=inp_dim,
+                        out_dim=out_dim,
                     )
 
     finally:
         if worker_pool is not None:
             worker_pool.close()
             worker_pool.join()
+
+    # ---- Degree-zero summary ------------------------------------------------
+    total_rounds = len(relay_s1_zero_counts)
+    if total_rounds > 0:
+        n_alive_relays = args.num_relays - n_crash
+
+        avg_s1_zeros = sum(relay_s1_zero_counts) / total_rounds
+        avg_s3_zeros = sum(leaf_s3_zero_counts)  / total_rounds
+
+        # Fraction relative to alive relay count and total leaf count
+        frac_s1 = avg_s1_zeros / max(n_alive_relays, 1)
+        frac_s3 = avg_s3_zeros / args.num_leaves
+
+        print(f"\n{'='*60}")
+        print(f"Degree-zero summary over {total_rounds} rounds")
+        print(f"  crash_type={args.crash_type}  "
+              f"crash_rate={args.crash_rate:.0f}%  "
+              f"n_crash={n_crash}")
+        print(f"  Stage 1 — alive relays with 0 alive leaves sampled:")
+        print(f"    avg per round = {avg_s1_zeros:.2f} / {n_alive_relays} "
+              f"alive relays  ({100*frac_s1:.1f}%)")
+        print(f"  Stage 3 — leaves with 0 alive relays sampled:")
+        print(f"    avg per round = {avg_s3_zeros:.2f} / {args.num_leaves} "
+              f"leaves  ({100*frac_s3:.1f}%)")
+        print(f"{'='*60}")
+
+        metrics["avg_relay_s1_zeros"]    = avg_s1_zeros
+        metrics["avg_leaf_s3_zeros"]     = avg_s3_zeros
+        metrics["frac_relay_s1_zeros"]   = frac_s1
+        metrics["frac_leaf_s3_zeros"]    = frac_s3
 
     # ---- Save (identical to main.py) ----------------------------------------
     with open(filename + "_metrics.json", "w") as f:
