@@ -514,27 +514,71 @@ def main(args):
         # ------------------------------------------------------------------------
         # Graph Simulation Only (no actual training)
         # ------------------------------------------------------------------------
-        # These accumulators track spectral gap and edge usage across rounds
-        sum_spectral_gap = 0.0
-        sum_num_edges = 0
+
+        # Spectral gap and edge accumulators (unchanged)
+        sum_spectral_gap   = 0.0
+        sum_num_edges      = 0
         count_graph_rounds = 0
 
+        # Degree accumulators — ELL / p2p / HSL
+        outdeg_all_rounds  = []   # [n_nodes] tensor per round: out-degree per node
+        indeg_all_rounds   = []   # [n_nodes] tensor per round: in-degree per node
+
+        # Degree accumulators — TGL only
+        leaf_outdeg_s1_rounds  = []   # [n_leaves]: how many relays sampled each leaf
+        relay_indeg_s2_rounds  = []   # [n_relays]: relay in-degree from Stage 2 gossip
+        relay_outdeg_s3_rounds = []   # [n_relays]: how many leaves sampled each relay
+
+        # Topology pre-computation
         W_base = None
         if args.topo == 'base-graph':
-            graph = BaseGraph(args.num_leaves, args.k)
+            graph  = BaseGraph(args.num_leaves, args.k)
             W_base = graph.w_list
         elif args.topo == 'simple-base-graph':
-            graph = SimpleBaseGraph(args.num_leaves, args.k)
+            graph         = SimpleBaseGraph(args.num_leaves, args.k)
             W_simple_base = graph.w_list
+        elif args.topo == 'hsl':
+            n_l, n_r = args.num_leaves, args.num_relays
+            default_hub_degree = int(math.ceil(max(
+                args.b_lr + args.b_rr,
+                args.b_rr + n_l * args.b_rl / n_r
+            )))
+            default_spoke_degree = int(math.ceil(max(
+                n_r * args.b_lr / n_l,
+                args.b_rl
+            )))
+            hub_degree   = args.hub_degree   if args.hub_degree   is not None else default_hub_degree
+            spoke_degree = args.spoke_degree if args.spoke_degree is not None else default_spoke_degree
+            torch.manual_seed(args.seed)
+            hub_perm      = torch.randperm(args.num_leaves)
+            hub_indices   = hub_perm[:n_r].tolist()
+            spoke_indices = hub_perm[n_r:].tolist()
+            print(f"[HSL Sim] hub_degree={hub_degree}  spoke_degree={spoke_degree}")
+            tgl_edges = n_r * args.b_lr + n_r * args.b_rr + n_l * args.b_rl
+            hsl_edges = n_r * hub_degree + (n_l - n_r) * spoke_degree
+            print(f"[HSL Sim] Total edges => HSL: {hsl_edges}  TGL reference: {tgl_edges}")
 
+        # --------------------------------------------------------------------
+        # Simulation loop
+        # --------------------------------------------------------------------
         for rnd in tqdm(range(args.num_rounds), desc="Simulating Graphs"):
-            # Dummy dimension for node weights
-            d = 10
+            d        = 10
             leaf_wts = torch.randn(args.num_leaves, d, device=aggregator_device)
 
+            # ----------------------------------------------------------------
+            # p2p branch (all fixed-W topologies including HSL)
+            # ----------------------------------------------------------------
             if args.aggregation == 'p2p':
-                if args.topo == 'erdos-renyi':
-                    W = utils.create_erdos_renyi_graph(args.num_leaves, args.budget, aggregator_device)
+                if args.topo == 'hsl':
+                    _, W = aggregation.hsl_aggregation(
+                        leaf_wts,
+                        hub_indices, spoke_indices,
+                        hub_degree, spoke_degree,
+                        return_W=True
+                    )
+                elif args.topo == 'erdos-renyi':
+                    W = utils.create_erdos_renyi_graph(
+                        args.num_leaves, args.budget, aggregator_device)
                 elif args.topo == 'ring':
                     W = utils.create_ring_graph(args.num_leaves, aggregator_device)
                 elif args.topo == 'torus':
@@ -542,107 +586,239 @@ def main(args):
                 elif args.topo == 'base-graph':
                     W = W_base[rnd % len(W_base)].cuda()
                 else:
-                    W = utils.create_k_random_regular_graph(args.num_leaves, args.k, aggregator_device)
+                    W = utils.create_k_random_regular_graph(
+                        args.num_leaves, args.k, aggregator_device)
 
                 _ = aggregation.p2p_aggregation(leaf_wts, W)
 
-                # Edge count (exclude self edges for p2p)
-                num_edges = (W > 0).sum().item() - len(W)
+                # Binary W excluding self-loops
+                W_bin = (W > 0).float()
+                W_bin.fill_diagonal_(0.0)
 
-                # Compute spectral gap
-                e = torch.linalg.eigvals(W)
-                e_abs = torch.abs(e)
+                # Out-degree of node i = row i nonzero count (nodes i pulls from)
+                outdeg_all_rounds.append(W_bin.sum(dim=1).cpu())
+                # In-degree of node j = col j nonzero count (nodes that pull from j)
+                indeg_all_rounds.append(W_bin.sum(dim=0).cpu())
+
+                num_edges = W_bin.sum().item()
+                e         = torch.linalg.eigvals(W)
+                e_abs     = torch.abs(e)
                 e_sorted, _ = torch.sort(e_abs, descending=True)
-                gap_rnd = (1.0 - e_sorted[1]).item()
+                gap_rnd   = (1.0 - e_sorted[1]).item()
 
-                sum_spectral_gap += gap_rnd
-                sum_num_edges += num_edges
+                sum_spectral_gap   += gap_rnd
+                sum_num_edges      += num_edges
                 count_graph_rounds += 1
 
+            # ----------------------------------------------------------------
+            # ELL (p2p_local) branch
+            # ----------------------------------------------------------------
             elif args.aggregation == 'p2p_local':
-                updated_leaf_wts, W_local = aggregation.p2p_local_aggregation(
-                    leaf_wts, args.k, return_W=True
-                )
-                # Remove diagonal self-edges when counting
-                W_copy = W_local.clone()
-                for i in range(args.num_leaves):
-                    W_copy[i, i] = 0.0
-                num_edges = (W_copy > 0).sum().item()
+                _, W_local = aggregation.p2p_local_aggregation(
+                    leaf_wts, args.k, return_W=True)
 
-                # Compute spectral gap
-                e = torch.linalg.eigvals(W_local)
-                e_abs = torch.abs(e)
-                e_sorted, _ = torch.sort(e_abs, descending=True)
-                gap_rnd = (1.0 - e_sorted[1]).item()
+                W_bin = (W_local > 0).float()
+                W_bin.fill_diagonal_(0.0)
 
-                sum_spectral_gap += gap_rnd
-                sum_num_edges += num_edges
+                outdeg_all_rounds.append(W_bin.sum(dim=1).cpu())
+                indeg_all_rounds.append(W_bin.sum(dim=0).cpu())
+
+                num_edges    = W_bin.sum().item()
+                e            = torch.linalg.eigvals(W_local)
+                e_abs        = torch.abs(e)
+                e_sorted, _  = torch.sort(e_abs, descending=True)
+                gap_rnd      = (1.0 - e_sorted[1]).item()
+
+                sum_spectral_gap   += gap_rnd
+                sum_num_edges      += num_edges
                 count_graph_rounds += 1
 
+            # ----------------------------------------------------------------
+            # TGL branch
+            # ----------------------------------------------------------------
             elif args.aggregation == 'tgl':
-                # Stage 1: leaves->relays
-                stage1_matrix = torch.zeros((args.num_relays, args.num_leaves), device=aggregator_device)
+
+                # Stage 1: each relay samples b_lr leaves (relay controls its in-degree)
+                stage1_matrix = torch.zeros(
+                    (args.num_relays, args.num_leaves), device=aggregator_device)
                 for relay_id in range(args.num_relays):
                     if args.b_lr <= args.num_leaves:
-                        chosen_leaf_ids = torch.randperm(args.num_leaves, device=aggregator_device)[:args.b_lr]
+                        chosen = torch.randperm(
+                            args.num_leaves, device=aggregator_device)[:args.b_lr]
                     else:
-                        chosen_leaf_ids = torch.randint(0, args.num_leaves, (args.b_lr,), device=aggregator_device)
-                    for s_id in chosen_leaf_ids:
+                        chosen = torch.randint(
+                            0, args.num_leaves, (args.b_lr,), device=aggregator_device)
+                    for s_id in chosen:
                         stage1_matrix[relay_id, s_id] = 1.0
                 for row_i in range(args.num_relays):
                     row_sum = torch.sum(stage1_matrix[row_i])
                     if row_sum > 0:
                         stage1_matrix[row_i] /= row_sum
 
-                # Stage 2: relays->relays (p2p_local among relays)
+                # Stage 2: relay gossip (p2p_local among relays)
                 relay_wts = torch.randn(args.num_relays, d, device=aggregator_device)
                 _, stage2_matrix = aggregation.p2p_local_aggregation(
-                    relay_wts, args.b_rr, return_W=True
-                )
+                    relay_wts, args.b_rr, return_W=True)
 
-                # Stage 3: relays->leaves
-                stage3_matrix = torch.zeros((args.num_leaves, args.num_relays), device=aggregator_device)
+                # Stage 3: each leaf samples b_rl relays (leaf controls its in-degree)
+                stage3_matrix = torch.zeros(
+                    (args.num_leaves, args.num_relays), device=aggregator_device)
                 for leaf_id in range(args.num_leaves):
                     if args.b_rl <= args.num_relays:
-                        chosen_relay_ids = torch.randperm(args.num_relays, device=aggregator_device)[:args.b_rl]
+                        chosen = torch.randperm(
+                            args.num_relays, device=aggregator_device)[:args.b_rl]
                     else:
-                        chosen_relay_ids = torch.randint(0, args.num_relays, (args.b_rl,), device=aggregator_device)
-                    for h_id in chosen_relay_ids:
+                        chosen = torch.randint(
+                            0, args.num_relays, (args.b_rl,), device=aggregator_device)
+                    for h_id in chosen:
                         stage3_matrix[leaf_id, h_id] = 1.0
                 for row_i in range(args.num_leaves):
                     row_sum = torch.sum(stage3_matrix[row_i])
                     if row_sum > 0:
                         stage3_matrix[row_i] /= row_sum
 
-                # Total directed edges across the three stages
-                edges_stage1 = (stage1_matrix > 0).sum().item()
-                W_copy = stage2_matrix.clone()
-                for i in range(args.num_relays):
-                    W_copy[i, i] = 0.0
-                edges_stage2 = (W_copy > 0).sum().item()
-                edges_stage3 = (stage3_matrix > 0).sum().item()
-                total_edges = edges_stage1 + edges_stage2 + edges_stage3
+                # ---- Degree profiling ----
 
-                # Effective mixing matrix for this round (leaves x leaves)
-                W_eff_round = torch.matmul(stage3_matrix, torch.matmul(stage2_matrix, stage1_matrix))
-                e = torch.linalg.eigvals(W_eff_round)
-                e_abs = torch.abs(e)
-                e_sorted, _ = torch.sort(e_abs, descending=True)
-                gap_rnd = (1.0 - e_sorted[1]).item()
+                # Stage 1: leaf out-degree = column sums of binary stage1_matrix
+                # stage1_matrix[relay, leaf] > 0 means relay pulls from leaf
+                # col j nonzero count = how many relays sampled leaf j
+                s1_bin = (stage1_matrix > 0).float()        # [n_r, n_l]
+                leaf_outdeg_s1_rounds.append(
+                    s1_bin.sum(dim=0).cpu())                 # [n_l]
 
-                sum_spectral_gap += gap_rnd
-                sum_num_edges += total_edges
+                # Stage 2: relay in-degree = column sums of binary stage2_matrix excl. diagonal
+                # stage2_matrix[i, j] > 0 means relay i pulls from relay j
+                # col j nonzero count excl. diagonal = how many relays pull from relay j
+                s2_bin = (stage2_matrix > 0).float()
+                s2_bin.fill_diagonal_(0.0)
+                relay_indeg_s2_rounds.append(
+                    s2_bin.sum(dim=0).cpu())                 # [n_r]
+
+                # Stage 3: relay out-degree = column sums of binary stage3_matrix
+                # stage3_matrix[leaf, relay] > 0 means leaf pulls from relay
+                # col h nonzero count = how many leaves sampled relay h
+                s3_bin = (stage3_matrix > 0).float()        # [n_l, n_r]
+                relay_outdeg_s3_rounds.append(
+                    s3_bin.sum(dim=0).cpu())                 # [n_r]
+
+                # Edge count
+                edges_stage1 = s1_bin.sum().item()
+                edges_stage2 = s2_bin.sum().item()
+                edges_stage3 = s3_bin.sum().item()
+                total_edges  = edges_stage1 + edges_stage2 + edges_stage3
+
+                # Spectral gap of effective leaf-to-leaf mixing matrix
+                W_eff_round = torch.matmul(
+                    stage3_matrix,
+                    torch.matmul(stage2_matrix, stage1_matrix))
+                e            = torch.linalg.eigvals(W_eff_round)
+                e_abs        = torch.abs(e)
+                e_sorted, _  = torch.sort(e_abs, descending=True)
+                gap_rnd      = (1.0 - e_sorted[1]).item()
+
+                sum_spectral_gap   += gap_rnd
+                sum_num_edges      += total_edges
                 count_graph_rounds += 1
 
-        # Once simulation is complete, report average spectral gap and edges
-        if count_graph_rounds > 0:
-            avg_gap = sum_spectral_gap / float(count_graph_rounds)
-            avg_edges = sum_num_edges / float(count_graph_rounds)
-            metrics['avg_spectral_gap'] = avg_gap
-            metrics['avg_num_edges'] = avg_edges
-            print(f"[Info] Average spectral gap across rounds: {avg_gap:.6f}")
-            print(f"[Info] Average directed edges per round: {avg_edges:.2f}")
+        # --------------------------------------------------------------------
+        # Degree statistics helper
+        # --------------------------------------------------------------------
+        def degree_stats(rounds_list, label, split_at=None, split_labels=None):
+            """
+            rounds_list  : list of 1-D float tensors [n_nodes], one per round
+            split_at     : optional int — split tensor at this index to report
+                           two node-type groups separately (e.g. hubs vs spokes)
+            split_labels : tuple of two strings for the two groups
+            Returns a dict saved into metrics.
+            """
+            if not rounds_list:
+                return {}
+            mat = torch.stack(rounds_list, dim=0)   # [R, N]
 
+            def _report(m, name):
+                flat          = m.flatten()
+                per_node_mean = m.mean(dim=0)
+                d = {
+                    'avg':          round(flat.mean().item(), 4),
+                    'min':          round(flat.min().item(), 4),
+                    'max':          round(flat.max().item(), 4),
+                    'std':          round(flat.std().item(), 4),
+                    'var':          round(flat.var().item(), 4),
+                    'min_node_avg': round(per_node_mean.min().item(), 4),
+                    'max_node_avg': round(per_node_mean.max().item(), 4),
+                    'std_node_avg': round(per_node_mean.std().item(), 4),
+                }
+                print(f"\n  [{name}]")
+                print(f"    all (round,node) pairs: "
+                      f"avg={d['avg']:.3f}  min={d['min']:.0f}  "
+                      f"max={d['max']:.0f}  std={d['std']:.3f}  "
+                      f"var={d['var']:.3f}")
+                print(f"    per-node avg across rounds: "
+                      f"min={d['min_node_avg']:.3f}  "
+                      f"max={d['max_node_avg']:.3f}  "
+                      f"std={d['std_node_avg']:.3f}")
+                return d
+
+            print(f"\n{'='*60}")
+            print(f"  {label}")
+            print(f"{'='*60}")
+
+            result = {'all': _report(mat, 'all nodes')}
+
+            if split_at is not None and split_labels is not None:
+                result[split_labels[0]] = _report(mat[:, :split_at],  split_labels[0])
+                result[split_labels[1]] = _report(mat[:, split_at:], split_labels[1])
+
+            return result
+
+        # --------------------------------------------------------------------
+        # Summary output
+        # --------------------------------------------------------------------
+        if count_graph_rounds > 0:
+            avg_gap   = sum_spectral_gap / float(count_graph_rounds)
+            avg_edges = sum_num_edges    / float(count_graph_rounds)
+            metrics['avg_spectral_gap'] = avg_gap
+            metrics['avg_num_edges']    = avg_edges
+            print(f"\n[Info] Average spectral gap across rounds: {avg_gap:.6f}")
+            print(f"[Info] Average directed edges per round:   {avg_edges:.2f}")
+
+            # ELL / p2p / HSL degree stats
+            if outdeg_all_rounds:
+                split_at     = None
+                split_labels = None
+                if args.topo == 'hsl':
+                    # Rearrange so hub columns come first, then spokes
+                    all_idx = hub_indices + spoke_indices
+                    outdeg_all_rounds = [t[all_idx] for t in outdeg_all_rounds]
+                    indeg_all_rounds  = [t[all_idx] for t in indeg_all_rounds]
+                    split_at     = len(hub_indices)
+                    split_labels = ('hubs', 'spokes')
+
+                metrics['outdeg_stats'] = degree_stats(
+                    outdeg_all_rounds,
+                    f"OUT-degree — {args.aggregation} / {args.topo}",
+                    split_at, split_labels)
+                metrics['indeg_stats'] = degree_stats(
+                    indeg_all_rounds,
+                    f"IN-degree  — {args.aggregation} / {args.topo}",
+                    split_at, split_labels)
+
+            # TGL degree stats
+            if leaf_outdeg_s1_rounds:
+                metrics['tgl_leaf_outdeg_s1'] = degree_stats(
+                    leaf_outdeg_s1_rounds,
+                    "TGL Stage 1 — leaf OUT-degree "
+                    "(how many relays sampled each leaf)")
+
+                metrics['tgl_relay_indeg_s2'] = degree_stats(
+                    relay_indeg_s2_rounds,
+                    "TGL Stage 2 — relay IN-degree "
+                    "(how many relay peers each relay received from)")
+
+                metrics['tgl_relay_outdeg_s3'] = degree_stats(
+                    relay_outdeg_s3_rounds,
+                    "TGL Stage 3 — relay OUT-degree "
+                    "(how many leaves sampled each relay)")
     # ----------------------------------------------------------------------------------
     # Save final metrics to a JSON file
     # ----------------------------------------------------------------------------------
