@@ -4,62 +4,51 @@ fault_tolerance_exp.py
 TGL training with dynamic node failures using a retry-with-timeout protocol.
 Mirrors main.py exactly for all non-fault-tolerance logic.
 
+Fault model: binomial independent crashes
+-----------------------------------------
+Each relay (or leaf) independently fails with probability crash_prob per
+round. The number of crashed nodes follows Binomial(n_total, crash_prob),
+varying naturally across rounds. This is more realistic than a fixed quota
+and produces honest graceful degradation curves.
+
 Protocol design (coordinator-free, retry-with-cap)
 ---------------------------------------------------
-A leaf does not know which relays are alive. It probes relays one at a time
-and treats both crashed relays and overloaded relays identically — as a
-non-response (timeout). This unifies crash and overload under one mechanism.
-
-Relay capacity cap (Stage 3):
-  Each relay can respond to at most cap = ceil(1.5 * n_l * b_rl / n_r)
-  leaf requests per round. A relay that has hit its cap stops responding —
-  indistinguishable from a crashed relay from the leaf's perspective.
-  Under normal operation (0% crash) this cap is never binding since
-  expected load = n_l * b_rl / n_r and 1.5x headroom absorbs natural
-  variance. Under crashes, surviving relays absorb extra load until cap.
-
-Leaf retry budget (Stage 3):
-  Each leaf attempts up to b_rl_max = 2 * b_rl relay contacts per round.
-  It collects models from the first b_rl successful contacts and averages
-  them. If it exhausts b_rl_max attempts with fewer than b_rl successes,
-  it averages whatever it collected. If it collected nothing, it keeps its
-  own post-training model (s3_zero).
-
-Leaf processing order (Stage 3):
-  Leaves are processed in a randomly shuffled order each round. Early
-  leaves get first pick of relay capacity; late leaves may find more
-  relays at cap. This mirrors realistic network timing with no coordination.
-
 Stage 1:
-  Crashed relays do NOT sample leaves and do NOT update their model.
-  Their relay_states entry is frozen. Alive relays sample b_lr leaves
-  from the full pool (identical to main.py) and drop crashed leaves
-  silently. If all sampled leaves are crashed, the relay keeps its own
-  model (s1_zero).
+  Crashed relays are skipped entirely — frozen state.
+  Alive relays sample b_lr leaves from the full pool (identical to main.py)
+  and drop crashed leaves silently. s1_zero tracked if no alive leaves found.
 
 Stage 2:
-  Gossip runs only on the alive relay sub-tensor. Crashed relays are
-  completely excluded. b_rr is clipped to len(alive_relays) - 1 if needed
-  (unavoidable arithmetic, not a design choice).
+  Gossip runs only on the alive relay sub-tensor. Crashed relays excluded.
+  b_rr clipped to len(alive_relays) - 1 if needed (arithmetic only).
 
-Tracking:
-  Per round we track:
-    s1_zero_count: alive relays that got 0 alive leaves in Stage 1
-    s3_zero_count: leaves that collected 0 relay models in Stage 3
-    s3_partial_count: leaves that collected < b_rl but > 0 models
-  Summary statistics printed at end of training.
+Stage 3 (retry-with-cap):
+  Relay cap = ceil(relay_capacity_factor * n_l * b_rl / n_r).
+    - Relay is unavailable if crashed OR contact count >= cap.
+    - Crashed and overloaded relays are indistinguishable (both = timeout).
+  Leaf retry budget = ceil(leaf_retry_factor * b_rl) total attempts.
+    - Leaves probe relays in a random order from the full pool.
+    - Leaves are processed in random shuffled order each round so no leaf
+      is consistently disadvantaged by early vs late position.
+    - Leaf collects until b_rl successes or retry budget exhausted.
+    - If 0 collected: s3_zero (leaf keeps own post-training model).
+    - If 0 < collected < b_rl: s3_partial (leaf averages what it got).
 
-Crashes are resampled independently every round (dynamic / transient).
+Defaults:
+  relay_capacity_factor = 1.5  (50% headroom above expected load)
+  leaf_retry_factor     = 3.0  (3x target collection as max attempts)
+
+Summary statistics printed at end of training.
 
 Usage:
     python fault_tolerance_exp.py \\
         --dataset cifar10 --num_leaves 100 \\
         --num_relays 20 --b_lr 15 --b_rr 10 --b_rl 2 \\
-        --crash_type relay --crash_rate 20 \\
+        --crash_type relay --crash_prob 0.2 \\
         --lr 0.1 --bias 0.1 --num_local_iters 5 \\
         --num_rounds 1000 --eval_time 10 --num_workers 10 \\
         --monitor_model_drift --gpu 0 --seed 108 \\
-        --exp ft_relay20_cifar10_s100h20
+        --exp ft_relay_p20_cifar10_s100h20
 """
 
 import argparse
@@ -102,19 +91,22 @@ def parse_args():
     parser.add_argument("--b_rl", type=int, default=2,
                         help="Target relay models collected per leaf in Stage 3.")
 
-    # Fault injection
+    # Fault injection — binomial independent crashes
     parser.add_argument("--crash_type", type=str, default="relay",
                         choices=["relay", "leaf"])
-    parser.add_argument("--crash_rate", type=float, default=0.0,
-                        help="Percentage of nodes crashed per round (0-100).")
+    parser.add_argument("--crash_prob", type=float, default=0.0,
+                        help="Per-node independent crash probability per round "
+                             "(0.0 = no crashes, 0.4 = 40%% expected crash rate). "
+                             "Crashes are drawn from Binomial(n_total, crash_prob) "
+                             "independently each round.")
 
     # Retry-with-cap protocol parameters
     parser.add_argument("--relay_capacity_factor", type=float, default=1.5,
                         help="Relay cap = ceil(factor * n_l * b_rl / n_r). "
                              "Default 1.5 = 50%% headroom above expected load.")
-    parser.add_argument("--leaf_retry_factor", type=float, default=2.0,
+    parser.add_argument("--leaf_retry_factor", type=float, default=3.0,
                         help="Max leaf attempts = ceil(factor * b_rl). "
-                             "Default 2.0 = twice the target collection.")
+                             "Default 3.0 = three times the target collection.")
 
     # Training — identical to main.py
     parser.add_argument("--num_rounds",      type=int,   default=1000)
@@ -194,18 +186,22 @@ def main():
     test_data  = trainObject.test_data
 
     # ---- Protocol parameters ------------------------------------------------
-    # Relay capacity cap: max leaf connections each relay serves in Stage 3
     relay_cap = math.ceil(
         args.relay_capacity_factor * args.num_leaves * args.b_rl / args.num_relays
     )
-    # Leaf max attempts: max probes each leaf makes in Stage 3
     b_rl_max = math.ceil(args.leaf_retry_factor * args.b_rl)
 
+    expected_crashes = args.crash_prob * (
+        args.num_relays if args.crash_type == "relay" else args.num_leaves)
+
+    print(f"[Info] crash_type={args.crash_type}  "
+          f"crash_prob={args.crash_prob:.2f}  "
+          f"expected_crashes={expected_crashes:.1f} per round")
     print(f"[Info] relay_cap={relay_cap} per relay per round  "
-          f"(factor={args.relay_capacity_factor}x, "
+          f"(factor={args.relay_capacity_factor}x  "
           f"expected_load={args.num_leaves * args.b_rl / args.num_relays:.1f})")
     print(f"[Info] b_rl_max={b_rl_max} max attempts per leaf  "
-          f"(factor={args.leaf_retry_factor}x, target={args.b_rl})")
+          f"(factor={args.leaf_retry_factor}x  target={args.b_rl})")
 
     # ---- Model init (identical to main.py) ----------------------------------
     global_model = models.load_net(net_name, inp_dim, out_dim, aggregator_device)
@@ -243,24 +239,17 @@ def main():
     metrics = {
         "round": [], "global_acc": [], "global_loss": [],
         "local_acc": [], "local_loss": [], "leaf_acc": [],
-        "n_crashed": [],
+        "n_crashed_per_round": [],        # actual crash count each eval round
     }
     if args.monitor_model_drift:
         metrics["pre_drift"]  = []
         metrics["post_drift"] = []
 
-    # ---- Crash count --------------------------------------------------------
-    n_total = args.num_relays if args.crash_type == "relay" else args.num_leaves
-    n_crash = max(0, int(math.floor(n_total * args.crash_rate / 100.0)))
-
-    print(f"[Info] crash_type={args.crash_type}  "
-          f"crash_rate={args.crash_rate:.0f}%  "
-          f"n_crash={n_crash}/{n_total} per round")
-
     # ---- Degree-zero and partial trackers -----------------------------------
-    relay_s1_zero_counts   = []   # alive relays with 0 alive leaves in Stage 1
-    leaf_s3_zero_counts    = []   # leaves with 0 collected models in Stage 3
-    leaf_s3_partial_counts = []   # leaves with 0 < collected < b_rl in Stage 3
+    relay_s1_zero_counts   = []
+    leaf_s3_zero_counts    = []
+    leaf_s3_partial_counts = []
+    actual_crash_counts    = []   # actual number crashed each round (varies)
 
     # ---- Model drift helper (identical to main.py) --------------------------
     def compute_model_drift(stack):
@@ -275,17 +264,23 @@ def main():
     try:
         for rnd in range(args.num_rounds):
 
-            # --- Sample crashed nodes ----------------------------------------
+            # --- Binomial independent crash sampling -------------------------
+            # Each node independently crashes with probability crash_prob.
+            # Number of crashes ~ Binomial(n_total, crash_prob) — varies each round.
             if args.crash_type == "relay":
                 crashed_relays = set(
-                    random.sample(range(args.num_relays), n_crash)
-                ) if n_crash > 0 else set()
+                    r for r in range(args.num_relays)
+                    if random.random() < args.crash_prob
+                )
                 crashed_leaves = set()
+                actual_crash_counts.append(len(crashed_relays))
             else:
                 crashed_relays = set()
                 crashed_leaves = set(
-                    random.sample(range(args.num_leaves), n_crash)
-                ) if n_crash > 0 else set()
+                    l for l in range(args.num_leaves)
+                    if random.random() < args.crash_prob
+                )
+                actual_crash_counts.append(len(crashed_leaves))
 
             alive_relays = [r for r in range(args.num_relays)
                             if r not in crashed_relays]
@@ -317,14 +312,12 @@ def main():
 
             # =================================================================
             # Stage 1: leaf -> relay
-            # Crashed relays are completely skipped — frozen state.
-            # Alive relays sample b_lr leaves from the full pool (identical
-            # to main.py) and drop crashed leaves silently.
+            # Crashed relays skipped entirely — frozen state.
+            # Alive relays sample b_lr leaves from full pool, drop crashed.
             # =================================================================
             rnd_s1_zeros = 0
 
             for relay_id in alive_relays:
-                # Sample identical to main.py
                 if args.b_lr <= args.num_leaves:
                     sampled = torch.randperm(
                         args.num_leaves,
@@ -334,25 +327,22 @@ def main():
                         0, args.num_leaves,
                         (args.b_lr,), device=aggregator_device)
 
-                # Drop crashed leaves — no resampling
                 alive_sampled = [int(l) for l in sampled
                                  if int(l) not in crashed_leaves]
 
                 if len(alive_sampled) == 0:
                     rnd_s1_zeros += 1
-                    # relay keeps its own current model — nothing written
                 else:
                     chosen = torch.tensor(
                         alive_sampled, device=aggregator_device)
                     relay_states[relay_id] = \
                         node_states[chosen].mean(dim=0).detach()
-            # crashed relays: relay_states[relay_id] frozen throughout
 
             relay_s1_zero_counts.append(rnd_s1_zeros)
 
             # =================================================================
             # Stage 2: relay <-> relay gossip
-            # Run only on alive relay sub-tensor. Crashed relays excluded.
+            # Only alive relays participate. Crashed relays fully excluded.
             # =================================================================
             if len(alive_relays) > 1:
                 alive_relay_tensor = relay_states[alive_relays]
@@ -362,34 +352,24 @@ def main():
                 updated_alive = updated_alive.detach()
                 for idx, relay_id in enumerate(alive_relays):
                     relay_states[relay_id] = updated_alive[idx]
-            # If only 1 alive relay: no gossip — state unchanged
-            # crashed relays: relay_states[relay_id] still frozen
 
             # =================================================================
-            # Stage 3: relay -> leaf (retry-with-cap protocol)
+            # Stage 3: relay -> leaf (retry-with-cap, coordinator-free)
             #
-            # Each relay has a contact counter, capped at relay_cap.
-            # A relay that is crashed OR at cap is treated as unavailable
-            # (timeout) — indistinguishable from the leaf's perspective.
-            #
-            # Leaves are processed in random order each round.
-            # Each leaf probes up to b_rl_max relays without replacement.
-            # It collects from the first b_rl successful contacts.
-            # If all probes fail, leaf keeps its own post-training model.
+            # Relay contact counters reset each round.
+            # Leaves processed in random shuffled order.
+            # Each leaf probes relays in random order from full pool.
+            # Relay unavailable if: crashed OR contact_count >= relay_cap.
+            # Leaf stops when b_rl collected OR b_rl_max attempts exhausted.
             # =================================================================
             rnd_s3_zeros    = 0
             rnd_s3_partials = 0
 
-            # Relay contact counters — reset each round
             relay_contact_count = {r: 0 for r in range(args.num_relays)}
 
-            # Process leaves in random order
             leaf_order = list(range(args.num_leaves))
             random.shuffle(leaf_order)
 
-            # Pre-build shuffled relay probe sequences — one per leaf
-            # Each leaf gets a random permutation of all n_r relay ids
-            # It probes in this order until b_rl successes or b_rl_max attempts
             for leaf_id in leaf_order:
                 probe_order = random.sample(
                     range(args.num_relays), args.num_relays)
@@ -405,23 +385,20 @@ def main():
 
                     attempts += 1
 
-                    # Relay is unavailable if crashed OR at cap
                     if relay_id in crashed_relays:
-                        continue   # timeout — try next
+                        continue
                     if relay_contact_count[relay_id] >= relay_cap:
-                        continue   # overloaded — timeout — try next
+                        continue
 
-                    # Success — collect model and increment counter
                     collected.append(relay_states[relay_id])
                     relay_contact_count[relay_id] += 1
 
                 if len(collected) == 0:
-                    # Hard zero — leaf keeps its own post-training model
                     rnd_s3_zeros += 1
+                    # leaf keeps its own post-training model
                 else:
                     if len(collected) < args.b_rl:
                         rnd_s3_partials += 1
-                    # Average collected models
                     stacked = torch.stack(collected, dim=0)
                     node_states[leaf_id] = stacked.mean(dim=0).detach()
 
@@ -436,7 +413,8 @@ def main():
             # Evaluation (identical to main.py parallel branch)
             # -----------------------------------------------------------------
             if (rnd + 1) % args.eval_time == 0:
-                metrics["n_crashed"].append(n_crash)
+                n_crashed_this_round = actual_crash_counts[-1]
+                metrics["n_crashed_per_round"].append(n_crashed_this_round)
 
                 if args.num_workers > 0:
                     print(f"[Round {rnd+1}] Starting Parallel Evaluation...")
@@ -449,9 +427,10 @@ def main():
                     metrics["global_loss"].append(list(g_losses))
 
                     print(f"[Round {rnd+1}] "
-                          f"crash={args.crash_rate:.0f}% ({args.crash_type}) "
+                          f"crash_prob={args.crash_prob:.2f} "
+                          f"({args.crash_type}) "
                           f"Acc:[{min(g_accs):.4f},{max(g_accs):.4f}] "
-                          f"crashed={n_crash}/{n_total} "
+                          f"crashed={n_crashed_this_round} "
                           f"S1-zeros={rnd_s1_zeros} "
                           f"S3-zeros={rnd_s3_zeros} "
                           f"S3-partial={rnd_s3_partials}")
@@ -473,45 +452,53 @@ def main():
             worker_pool.close()
             worker_pool.join()
 
-    # ---- Degree-zero summary ------------------------------------------------
-    total_rounds   = len(relay_s1_zero_counts)
-    n_alive_relays = args.num_relays - n_crash
+    # ---- Summary statistics -------------------------------------------------
+    total_rounds = len(relay_s1_zero_counts)
 
     if total_rounds > 0:
-        avg_s1_zeros    = sum(relay_s1_zero_counts)    / total_rounds
-        avg_s3_zeros    = sum(leaf_s3_zero_counts)     / total_rounds
-        avg_s3_partials = sum(leaf_s3_partial_counts)  / total_rounds
+        avg_crashed     = sum(actual_crash_counts)    / total_rounds
+        avg_s1_zeros    = sum(relay_s1_zero_counts)   / total_rounds
+        avg_s3_zeros    = sum(leaf_s3_zero_counts)    / total_rounds
+        avg_s3_partials = sum(leaf_s3_partial_counts) / total_rounds
 
-        frac_s1 = avg_s1_zeros    / max(n_alive_relays, 1)
-        frac_s3_zero    = avg_s3_zeros    / args.num_leaves
-        frac_s3_partial = avg_s3_partials / args.num_leaves
+        n_total = args.num_relays if args.crash_type == "relay" else args.num_leaves
+        avg_alive = n_total - avg_crashed
+
+        frac_s1     = avg_s1_zeros    / max(avg_alive, 1)
+        frac_s3z    = avg_s3_zeros    / args.num_leaves
+        frac_s3p    = avg_s3_partials / args.num_leaves
 
         print(f"\n{'='*60}")
         print(f"Retry-with-cap summary over {total_rounds} rounds")
         print(f"  crash_type={args.crash_type}  "
-              f"crash_rate={args.crash_rate:.0f}%  "
-              f"n_crash={n_crash}  "
+              f"crash_prob={args.crash_prob:.2f}  "
               f"relay_cap={relay_cap}  "
               f"b_rl_max={b_rl_max}")
-        print(f"\n  Stage 1 — alive relays with 0 alive leaves sampled:")
-        print(f"    avg/round = {avg_s1_zeros:.2f} / {n_alive_relays} "
+        print(f"\n  Actual crashes per round:")
+        print(f"    avg={avg_crashed:.2f}  "
+              f"min={min(actual_crash_counts)}  "
+              f"max={max(actual_crash_counts)}  "
+              f"(expected={args.crash_prob * n_total:.1f})")
+        print(f"\n  Stage 1 — alive relays with 0 alive leaves:")
+        print(f"    avg/round={avg_s1_zeros:.2f} / {avg_alive:.1f} "
               f"alive relays  ({100*frac_s1:.1f}%)")
         print(f"\n  Stage 3 — leaves with 0 models collected (hard zero):")
-        print(f"    avg/round = {avg_s3_zeros:.2f} / {args.num_leaves} "
-              f"leaves  ({100*frac_s3_zero:.1f}%)")
+        print(f"    avg/round={avg_s3_zeros:.2f} / {args.num_leaves} "
+              f"leaves  ({100*frac_s3z:.1f}%)")
         print(f"\n  Stage 3 — leaves with partial collection (0 < n < b_rl):")
-        print(f"    avg/round = {avg_s3_partials:.2f} / {args.num_leaves} "
-              f"leaves  ({100*frac_s3_partial:.1f}%)")
+        print(f"    avg/round={avg_s3_partials:.2f} / {args.num_leaves} "
+              f"leaves  ({100*frac_s3p:.1f}%)")
         print(f"{'='*60}")
 
-        metrics["relay_cap"]              = relay_cap
-        metrics["b_rl_max"]               = b_rl_max
-        metrics["avg_relay_s1_zeros"]     = avg_s1_zeros
-        metrics["avg_leaf_s3_zeros"]      = avg_s3_zeros
-        metrics["avg_leaf_s3_partials"]   = avg_s3_partials
-        metrics["frac_relay_s1_zeros"]    = frac_s1
-        metrics["frac_leaf_s3_zeros"]     = frac_s3_zero
-        metrics["frac_leaf_s3_partials"]  = frac_s3_partial
+        metrics["relay_cap"]             = relay_cap
+        metrics["b_rl_max"]              = b_rl_max
+        metrics["avg_crashed_per_round"] = avg_crashed
+        metrics["avg_relay_s1_zeros"]    = avg_s1_zeros
+        metrics["avg_leaf_s3_zeros"]     = avg_s3_zeros
+        metrics["avg_leaf_s3_partials"]  = avg_s3_partials
+        metrics["frac_relay_s1_zeros"]   = frac_s1
+        metrics["frac_leaf_s3_zeros"]    = frac_s3z
+        metrics["frac_leaf_s3_partials"] = frac_s3p
 
     # ---- Save (identical to main.py) ----------------------------------------
     with open(filename + "_metrics.json", "w") as f:
