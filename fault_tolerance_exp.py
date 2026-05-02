@@ -348,28 +348,20 @@ def main():
             rnd_leaf_s3_zeros = 0
 
             for leaf_id in range(args.num_leaves):
-                # Sample identical to main.py
-                if args.b_rl <= args.num_relays:
-                    sampled = torch.randperm(
-                        args.num_relays,
-                        device=aggregator_device)[:args.b_rl]
-                else:
-                    sampled = torch.randint(
-                        0, args.num_relays,
-                        (args.b_rl,), device=aggregator_device)
-
-                # Drop crashed relays — no resampling
-                alive_sampled = [int(r) for r in sampled
-                                 if int(r) not in crashed_relays]
-
-                if len(alive_sampled) == 0:
-                    # Leaf keeps its own post-training model — nothing written
+                pool = alive_relays  # sample only from alive relays
+                if len(pool) == 0:
+                    # no alive relays at all — leaf keeps its own model
                     rnd_leaf_s3_zeros += 1
-                else:
-                    chosen = torch.tensor(
-                        alive_sampled, device=aggregator_device)
-                    node_states[leaf_id] = \
-                        relay_states[chosen].mean(dim=0).detach()
+                    continue
+
+                k = min(args.b_rl, len(pool))
+                perm = torch.randperm(len(pool), device=aggregator_device)[:k]
+                chosen_ids = torch.tensor(
+                    [pool[i] for i in perm.tolist()],
+                    device=aggregator_device)
+                node_states[leaf_id] = \
+                    relay_states[chosen_ids].mean(dim=0).detach()
+                # S3-zeros only increments if NO alive relays exist at all
 
             leaf_s3_zero_counts.append(rnd_leaf_s3_zeros)
 
