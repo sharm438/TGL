@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+import math
 import pdb
 
 def federated_aggregation(stack, weights):
@@ -109,6 +110,46 @@ def hsl_aggregation(node_wts, hub_indices, spoke_indices,
         return updated_wts, W
     return updated_wts
             
+def teleportation_gossip(active_wts, return_W=False):
+    """
+    Gossip among k active nodes using a static exponential graph.
+    Node i (local index 0..k-1) connects to (i + 2^j) mod k
+    for j = 0, 1, ..., floor(log2(k)) - 1.
+    Self-loop always included. Row-stochastic.
+
+    active_wts : [k, d] tensor — models of the k active nodes
+    Returns    : updated [k, d] tensor, optionally W [k, k]
+
+    Gossip directed edges = k * floor(log2(k))  (excluding self-loops)
+    Total per-round cost with handoffs = k*(1 + floor(log2(k)))
+    """
+    k      = active_wts.shape[0]
+    device = active_wts.device
+
+    if k == 1:
+        if return_W:
+            return active_wts.clone(), torch.eye(1, device=device)
+        return active_wts.clone()
+
+    log_k = int(math.floor(math.log2(k)))
+    W     = torch.zeros((k, k), device=device)
+
+    for i in range(k):
+        W[i, i] = 1.0                      # self-loop
+        for j in range(log_k):
+            nbr = (i + 2 ** j) % k
+            W[i, nbr] = 1.0
+
+    row_sums = W.sum(dim=1, keepdim=True)
+    W = W / (row_sums + 1e-10)
+
+    updated = torch.mm(W, active_wts)
+
+    if return_W:
+        return updated, W
+    return updated
+
+
 def old_p2p_local_aggregation(node_wts, outdegree, return_W=False, alive_mask=None):
     """
     node_wts: shape [num_nodes, dim]
@@ -160,4 +201,3 @@ def old_p2p_local_aggregation(node_wts, outdegree, return_W=False, alive_mask=No
         return updated_wts, W_local
     else:
         return updated_wts
-

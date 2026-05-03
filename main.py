@@ -36,7 +36,9 @@ def parse_args():
                         choices=['fedsgd', 'p2p', 'p2p_local', 'tgl'],
                         help='Aggregation protocol to use.')
     parser.add_argument("--topo", type=str, default=None,
-                        choices=['ring', 'torus', 'erdos-renyi', 'base-graph', 'simple-base-graph', 'exponential', 'hsl'],
+                        choices=['ring', 'torus', 'erdos-renyi', 'base-graph',
+                                 'simple-base-graph', 'exponential', 'hsl',
+                                 'teleportation'],
                         help='Topology to use for p2p graphs.')
     parser.add_argument("--budget", type=int, default=None,
                         help='Number of edges in an undirected p2p graph '
@@ -93,7 +95,14 @@ def parse_args():
     parser.add_argument("--spoke_degree", type=int, default=None,
                         help='Out-degree for spoke nodes in hsl topology. '
                              'If None, computed from b_lr, b_rl, num_relays, num_leaves.')
-                             
+
+    # teleportation parameters — used when --topo teleportation
+    parser.add_argument("--k_teleport", type=int, default=None,
+                        help='Number of active nodes per round for teleportation. '
+                             'Must be in [1, num_leaves). '
+                             'Edge cost per round = k*(1 + floor(log2(k))). '
+                             'E.g. k=90 on 100 nodes gives 630 directed edges.')
+
     return parser.parse_args()
 
 
@@ -291,10 +300,31 @@ def main(args):
             hub_indices   = hub_perm[:n_r].tolist()
             spoke_indices = hub_perm[n_r:].tolist()
             print(f"[HSL] Hub nodes (first {n_r}): {sorted(hub_indices)}")
+        elif args.topo == 'teleportation':
+            k_tp = args.k_teleport
+            if k_tp is None or k_tp < 1 or k_tp >= args.num_leaves:
+                raise ValueError(
+                    f"--k_teleport must be in [1, num_leaves-1={args.num_leaves-1}]. "
+                    f"Got {k_tp}.")
+            log_k_tp = int(math.floor(math.log2(k_tp)))
+            tp_edges = k_tp * (1 + log_k_tp)
+            print(f"[Teleportation] k={k_tp}  floor(log2(k))={log_k_tp}  "
+                  f"edges/round={tp_edges}  "
+                  f"(handoffs={k_tp}, gossip={k_tp * log_k_tp})")
+            # token_states[t]: live model for token t, size [k, d]
+            # Initialise by randomly assigning k nodes as the first active set.
+            torch.manual_seed(args.seed)
+            first_active    = torch.randperm(args.num_leaves)[:k_tp].tolist()
+            token_states    = node_states[first_active].clone()  # [k, d]
+            prev_active_ids = first_active                       # list of k node ids
+            print(f"[Teleportation] First active nodes (first 10 shown): "
+                  f"{sorted(first_active)[:10]}...")
         try:    
             for rnd in range(args.num_rounds):
-                # Step 2: Each leaf trains locally and returns updated weights
-                for node_id in range(args.num_leaves):
+                # Step 2: Each leaf trains locally and returns updated weights.
+                # Teleportation handles training internally — skip global loop.
+                tp_mode = (args.aggregation == 'p2p' and args.topo == 'teleportation')
+                for node_id in ([] if tp_mode else range(args.num_leaves)):
                     start_wts = node_states[node_id].detach().clone()
                     updated_wts = train_node.local_train_worker_inline(
                         node_id,
@@ -340,7 +370,48 @@ def main(args):
                             return_W=True
                         )
                         node_states = node_states.detach()
-                    else: 
+                    elif args.topo == 'teleportation':
+                        import random as _random
+
+                        # --- Sample k new active nodes ---
+                        new_active_ids = _random.sample(
+                            range(args.num_leaves), k_tp)
+
+                        # --- Local training: each active node inherits its
+                        #     token model and trains on its own data ---
+                        trained = torch.zeros_like(token_states)
+                        for t, node_id in enumerate(new_active_ids):
+                            # token_states[t] is the inherited model for this token
+                            start_wts = token_states[t].detach().clone()
+                            updated_wts = train_node.local_train_worker_inline(
+                                node_id,
+                                start_wts,
+                                distributed_data[node_id],
+                                distributed_label[node_id],
+                                inp_dim, out_dim, net_name,
+                                args.num_local_iters,
+                                batch_size, args.lr,
+                                aggregator_device,
+                                args.sample_type,
+                                rr_indices,
+                            )
+                            trained[t] = updated_wts.detach()
+
+                        # --- Gossip among k active nodes (exponential graph) ---
+                        token_states, W_tp = aggregation.teleportation_gossip(
+                            trained, return_W=True)
+                        token_states = token_states.detach()
+
+                        # --- Write post-gossip models to node_states for eval ---
+                        # Active nodes get their fresh post-gossip model.
+                        # Inactive nodes keep previous round's node_states.
+                        for t, node_id in enumerate(new_active_ids):
+                            node_states[node_id] = token_states[t]
+                        node_states = node_states.detach()
+
+                        prev_active_ids = new_active_ids
+                        W = W_tp   # expose for degree monitoring
+                    else:
                         if args.topo == 'ring':
                             W = utils.create_ring_graph(args.num_leaves, aggregator_device)
                         elif args.topo == 'torus':
