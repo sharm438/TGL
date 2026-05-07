@@ -1,6 +1,6 @@
-# Beyond Flat Gossip: Relay Gossip Learning for Scalable Collaborative AI
+# Beyond Flat Gossip: Tiered Gossip Learning for Scalable Collaborative AI
 
-**TGL** (Relay Gossip Learning) is a communication-efficient decentralized collaborative learning framework. It introduces a two-tier push–gossip–pull protocol where resource-constrained leaf nodes communicate through a small relay layer, achieving strong global mixing without increasing the per-leaf communication burden as the network scales.
+**TGL** (Tiered Gossip Learning) is a communication-efficient decentralized collaborative learning framework. It introduces a two-tier push–gossip–pull protocol where resource-constrained leaf nodes communicate through a small relay layer, achieving strong global mixing without increasing the per-leaf communication burden as the network scales.
 
 > **Paper:** *Beyond Flat Gossip: Relay Gossip Learning for Scalable Collaborative AI*  
 > Under review at NeurIPS 2026.
