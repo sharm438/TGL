@@ -1,206 +1,214 @@
-Below is a sample **README** for this code base. It contains an overview of the purpose, lists the important command-line arguments (with emphasis on the “store_true” type arguments), and provides example runs for various aggregation modes—**Federated Learning** (`fedsgd`), **EL Oracle** (`p2p`), **EL Local** (`p2p_local`), and **Hubs-and-Spokes Learning** (`hsl`).
+# Beyond Flat Gossip: Relay Gossip Learning for Scalable Collaborative AI
+
+**TGL** (Relay Gossip Learning) is a communication-efficient decentralized collaborative learning framework. It introduces a two-tier push–gossip–pull protocol where resource-constrained leaf nodes communicate through a small relay layer, achieving strong global mixing without increasing the per-leaf communication burden as the network scales.
+
+> **Paper:** *Beyond Flat Gossip: Relay Gossip Learning for Scalable Collaborative AI*  
+> Under review at NeurIPS 2026.
 
 ---
 
-# README
+## Repository Structure
 
-## Overview
-
-This repository implements a variety of distributed/federated learning paradigms with *non-IID* data distribution, including:
-
-- **Federated Learning** (`fedsgd`): A traditional server-based approach where a global parameter server averages updates from the nodes (spokes).
-- **Peer-to-Peer** (`p2p`): Decentralized baselines - Exponential Graph, BaseGraph, Erdos-Renyi, k-redular.
-- **EL Local** (`p2p_local`): A truly distributed peer-to-peer method where each node randomly picks \(k\) neighbors per round (without a global graph).
-- **Hubs-and-Spokes Learning** (`hsl`): A three-step process involving multiple hubs and spokes exchanging their models in different stages.
-
-### Key Features
-
-- **Non-IID data** distribution among spokes  
-- **Multiple datasets** (MNIST, CIFAR-10)  
-- **Flexible aggregator** choices (FL, P2P, P2P Local, HSL)  
-- **Seed control** for reproducibility  
-- **Optional** monitoring of model drift, node degrees, and graph simulation
+```
+main.py                  # Entry point — training, evaluation, graph simulation
+aggregation.py           # Federated, P2P, ELL, TGL, HSL, Teleportation aggregation
+train_node.py            # Inline local SGD per node
+eval_worker.py           # Parallel evaluation worker (multiprocessing)
+models.py                # ResNet-20, FEMNIST-CNN, SmallTransformer, LeNet, ViT
+utils.py                 # Data loading, Dirichlet distribution, graph utilities
+base_graph.py            # BaseGraph topology (structured k-peer mixing matrices)
+simple_base_graph.py     # HyperHyperCube and SimpleBaseGraph topologies
+dynamic_graph.py         # DynamicGraph base class (rotating mixing matrices)
+fault_tolerance_exp.py   # Crash-aware TGL-FT experiment with retry-cap protocol
+requirements.txt         # Python dependencies
+```
 
 ---
 
 ## Installation
 
-1. Install [PyTorch](https://pytorch.org/) (version >= 1.8 recommended).
-2. Install torchvision or other dependencies if needed:
-   ```bash
-   pip install torchvision
-   ```
-3. Clone this repository and ensure you have a `python` environment with `numpy`, `argparse`, etc.
-
----
-
-## Usage
-
-All scripts can be run via:
-
 ```bash
-python main.py [options]
+conda create -n tgl python=3.10 -y
+conda activate tgl
+pip install -r requirements.txt
 ```
 
-### Core Arguments
+**Key dependencies** (fill in exact versions from `requirements.txt`):
 
-| **Argument**                 | **Type**     | **Description**                                                                                                                                                                                                    |
-|------------------------------|--------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `--exp`                      | `str`        | **Experiment name** (used for output JSON files, e.g., `<exp>_metrics.json`).                                                                                                                                      |
-| `--dataset`                  | `str`        | Dataset to use: `mnist` or `cifar10`.                                                                                                                                                                              |
-| `--fraction`                 | `float`      | Fraction of the dataset to use (e.g., `1.0` = entire training set, `0.5` = half).                                                                                                                                  |
-| `--bias`                     | `float`      | Non-IIDness level. `0.0` → effectively IID, larger → more skewed distribution.                                                                                                                                     |
-| `--aggregation`              | `str`        | Aggregation method: `fedsgd`, `p2p`, `p2p_local`, or `hsl`.                                                                                                                                                        |
-| `--num_spokes`               | `int`        | Number of “spoke” nodes (clients).                                                                                                                                                                                 |
-| `--num_hubs`                 | `int`        | Number of hubs (applies only to `hsl`).                                                                                                                                                                           |
-| `--num_rounds`               | `int`        | Number of global communication rounds.                                                                                                                                                                            |
-| `--num_local_iters`          | `int`        | Number of local gradient steps each node performs per round.                                                                                                                                                       |
-| `--batch_size`               | `int`        | Local batch size on each node.                                                                                                                                                                                    |
-| `--eval_time`                | `int`        | Evaluate metrics every `eval_time` rounds.                                                                                                                                                                        |
-| `--gpu`                      | `int`        | GPU index to use (e.g. `0`). Use `-1` for CPU.                                                                                                                                                                     |
-| `--lr`                       | `float`      | Learning rate used in local training.                                                                                                                                                                             |
-| `--sample_type`              | `str`        | Local mini-batch sampling method: `round_robin` or `random`.                                                                                                                                                      |
-| `--seed`                     | `int`        | Random seed for reproducibility. `<=0` means no fixed seed.                                                                                                                                                       |
-
-#### Peer-to-Peer (P2P) Arguments
-
-| **Argument**  | **Type** | **Description**                                                                                                   |
-|---------------|----------|-------------------------------------------------------------------------------------------------------------------|
-| `--k`         | `int`    | - **P2P** (`p2p`) uses a centrally generated \(k\)-regular graph.  <br>- **EL Local** (`p2p_local`) each node chooses \(k\) neighbors. |
-
-#### Hubs-and-Spokes (HSL) Arguments
-
-| **Argument**  | **Type** | **Description**                                                                                                                                                                                              |
-|---------------|----------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `--b_lr`      | `int`    | **Stage 1**: Each hub randomly selects `b_lr` spokes and averages them. (Hub “indegree” from spokes)                                                                                                         |
-| `--b_rr`      | `int`    | **Stage 2**: Hubs mix with each other using an “EL Local” style aggregator with outdegree = `b_rr`.                                                                                                         |
-| `--b_rl`      | `int`    | **Stage 3**: Each spoke randomly selects `b_rl` hubs to average (Spoke “indegree” from hubs).                                                                                                               |
-
-### **store_true** Arguments
-
-| **Argument**                | **Type**       | **Description**                                                                                                                                                                                                                |
-|-----------------------------|----------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `--monitor_model_drift`     | `store_true`   | If set, computes the **model drift** among spokes (distance from the spoke models to their mean) **before** and **after** the aggregator step, each time we do an evaluation (`eval_time` intervals).                                                                 |
-| `--monitor_degree`          | `store_true`   | If set, computes and logs node in/out degrees every round (e.g., how many neighbors chose each node in P2P or HSL’s stages). This is saved separately (e.g., `<exp>_degree.json`).                                               |
-| `--graph_simulation_only`   | `store_true`   | If set, **no actual local training** is performed. Instead, the code only simulates the aggregator step (P2P / P2P Local / HSL) to obtain random mixing matrices each round. Useful for analyzing mixing properties, spectral gap, etc. |
+| Package | Version |
+|---|---|
+| torch | 2.3.1+cu121 |
+| torchvision | 0.18.1 |
+| torchtext | 0.18.0 |
+| torchdata | 0.9.0 |
+| torchaudio | 2.3.1+cu121 |
+| numpy | 1.26.3 |
+| portalocker | 3.1.1 |
+| sympy | (see requirements.txt) |
+| tqdm | (see requirements.txt) |
 
 ---
 
-## Example Runs
+## Arguments
 
-Below are example commands showing how to run the different modes:
+### Core
 
-1. **Federated Learning (FL / `fedsgd`):**
-   ```bash
-   python main.py \
-       --exp fed_mnist \
-       --dataset mnist \
-       --fraction 1.0 \
-       --bias 0.0 \
-       --aggregation fedsgd \
-       --num_spokes 10 \
-       --num_rounds 50 \
-       --num_local_iters 1 \
-       --batch_size 32 \
-       --eval_time 5 \
-       --gpu -1 \
-       --lr 0.01
-   ```
-   This runs standard federated averaging on MNIST with 10 spokes, using CPU (`--gpu -1`) for 50 rounds.
+| Argument | Description |
+|---|---|
+| `--dataset` | `mnist`, `cifar10`, `femnist`, `agnews` |
+| `--aggregation` | `fedsgd`, `p2p`, `p2p_local`, `tgl` |
+| `--num_leaves` | Number of leaf (worker) nodes |
+| `--bias` | Dirichlet concentration parameter α for non-IID split (lower = more heterogeneous) |
+| `--lr` | Learning rate |
+| `--num_local_iters` | Local SGD steps per round |
+| `--num_rounds` | Total communication rounds |
+| `--eval_time` | Evaluate every N rounds |
+| `--num_workers` | Parallel eval workers (0 = sequential) |
+| `--seed` | Random seed (108 used in all paper experiments) |
+| `--exp` | Output name — results saved to `outputs/<exp>_metrics.json` |
+| `--monitor_model_drift` | Log pre/post-aggregation L2 weight drift |
+| `--graph_simulation_only` | Skip training; simulate graph and report spectral gap and degree statistics |
 
-2. ** (P2P / `p2p`):**
-   ```bash
-   python main.py \
-       --exp p2p_mnist \
-       --dataset mnist \
-       --aggregation p2p \
-       --topo exponential \
-       --num_spokes 10 \
-       --num_rounds 50 \
-       --num_local_iters 5 \
-       --batch_size 32 \
-       --eval_time 5 \
-       --gpu 0 \
-       --lr 0.01 \
-       --bias 0.3
-   ```
-   - **EL Oracle** uses a globally generated *\(k\)-regular* matrix with `k=2`.  
-   - Each round, the aggregator re-samples or reuses a random permutation to build that matrix.
+### TGL (`--aggregation tgl`)
 
-3. **EL Local (P2P Local / `p2p_local`):**
-   ```bash
-   python main.py \
-       --exp p2p_local_mnist \
-       --dataset mnist \
-       --aggregation p2p_local \
-       --k 3 \
-       --num_spokes 10 \
-       --num_rounds 50 \
-       --num_local_iters 2 \
-       --batch_size 32 \
-       --eval_time 5 \
-       --gpu 0 \
-       --lr 0.01 \
-       --bias 0.5
-   ```
-   - **EL Local** has each node choose `k=3` random neighbors (plus itself) every round, with no global coordinator.
+| Argument | Description |
+|---|---|
+| `--num_relays` | Number of relay nodes |
+| `--b_lr` | Leaves sampled per relay in Stage 1 (leaf-to-relay budget) |
+| `--b_rr` | Relay-to-relay neighbours in Stage 2 |
+| `--b_rl` | Relays sampled per leaf in Stage 3 (relay-to-leaf budget) |
 
-4. **TGL (Tiered Gossip Learning / `hsl`):**
-   ```bash
-   python main.py \
-       --exp hsl_cifar \
-       --dataset cifar10 \
-       --aggregation hsl \
-       --num_leaves 12 \
-       --num_relays 3 \
-       --b_lr 2 \
-       --b_rr 1 \
-       --b_rl 2 \
-       --num_rounds 80 \
-       --num_local_iters 2 \
-       --batch_size 64 \
-       --eval_time 10 \
-       --gpu 0 \
-       --lr 0.005 \
-       --bias 0.4
-   ```
-   Here, each round has:
-   1. **Stage 1** (`b_hs=2`): Relays each pick 2 spokes.
-   2. **Stage 2** (`b_hh=1`): Relays mix among themselves (each picks 1 relay).
-   3. **Stage 3** (`b_sh=2`): Leaves each pick 2 relays to update from.
+### ELL (`--aggregation p2p_local`)
+
+| Argument | Description |
+|---|---|
+| `--k` | Random neighbours per node per round |
+
+### P2P fixed topology (`--aggregation p2p`)
+
+| Argument | Description |
+|---|---|
+| `--topo` | `ring`, `torus`, `erdos-renyi`, `base-graph`, `exponential`, `hsl`, `teleportation` |
+| `--budget` | Edge count for Erdős–Rényi graphs |
+| `--k` | Degree for `base-graph` or `exponential` |
+| `--num_relays` | Hub count for `hsl` topology |
+| `--hub_degree` | Out-degree for hub nodes in `hsl` |
+| `--spoke_degree` | Out-degree for spoke nodes in `hsl` |
+| `--k_teleport` | Active nodes per round for `teleportation` |
 
 ---
 
-## Additional Notes
+## Reproducing Paper Results
 
-- Use `--monitor_model_drift` to track and log how much node models deviate from each other each round.
-- Use `--monitor_degree` to track and log how many connections each node has in P2P or each stage in HSL.
-- For debugging or faster iteration, you can run **graph simulation only** by adding `--graph_simulation_only`. This **skips all data loading and local training** and only simulates the aggregator steps:
-  ```bash
-  python main.py \
-      --exp sim_p2p \
-      --aggregation p2p_local \
-      --num_leaves 10 \
-      --k 2 \
-      --num_rounds 30 \
-      --graph_simulation_only
-  ```
-  This will generate random mixing matrices, compute their average, spectral gap, etc., and save them to JSON, **without** doing any real training.
+All paper experiments use `--seed 108`. Outputs are written to `outputs/`.
 
-- **Reproducibility**: You can fix a seed for data partitioning and model initialization using `--seed <positive_int>`. For example:
-  ```bash
-  python main.py --seed 108 --aggregation p2p --k 2 ...
-  ```
+### TGL — CIFAR-10, 100 nodes (G3 configuration, 400 directed edges)
 
-- **Output Files**:  
-  - **`<exp>_metrics.json`**: Contains training/test metrics, spectral gap, average mixing matrix, etc., depending on aggregator.  
-  - **`<exp>_degree.json`**: If `--monitor_degree` is set, this contains arrays of node in/out degrees per round.
+```bash
+python main.py --monitor_model_drift \
+    --dataset cifar10 --aggregation tgl \
+    --num_leaves 100 --num_relays 20 \
+    --b_lr 10 --b_rr 5 --b_rl 1 \
+    --lr 0.1 --bias 0.1 --num_local_iters 5 \
+    --num_rounds 1000 --eval_time 10 --num_workers 10 \
+    --gpu 0 --seed 108 \
+    --exp tgl_cifar10_s100h20_G3
+```
+
+### ELL — CIFAR-10, 100 nodes (matched budget, k=4, 400 directed edges)
+
+```bash
+python main.py --monitor_model_drift \
+    --dataset cifar10 --aggregation p2p_local --k 4 \
+    --num_leaves 100 \
+    --lr 0.1 --bias 0.1 --num_local_iters 5 \
+    --num_rounds 1000 --eval_time 10 --num_workers 10 \
+    --gpu 0 --seed 108 \
+    --exp ell_cifar10_s100_k4
+```
+
+### FedSGD — CIFAR-10, 100 nodes
+
+```bash
+python main.py --monitor_model_drift \
+    --dataset cifar10 --aggregation fedsgd \
+    --num_leaves 100 \
+    --lr 0.1 --bias 0.1 --num_local_iters 5 \
+    --num_rounds 1000 --eval_time 10 --num_workers 10 \
+    --gpu 0 --seed 108 \
+    --exp fl_cifar10_s100
+```
+
+### TGL — FEMNIST, 175 nodes (G3 configuration, 885 directed edges)
+
+```bash
+python main.py --monitor_model_drift \
+    --dataset femnist --aggregation tgl \
+    --num_leaves 175 --num_relays 15 \
+    --b_lr 20 --b_rr 4 --b_rl 3 \
+    --lr 0.02 --num_local_iters 3 \
+    --num_rounds 1000 --eval_time 10 --num_workers 10 \
+    --gpu 0 --seed 108 \
+    --exp tgl_femnist_s175h15_G3
+```
 
 ---
 
-## Contact / Contributing
+## Fault Tolerance Experiments (TGL-FT)
 
-- Contributions or pull requests are welcome!  
-- For further issues or questions, please open an Issue on this repository.
+The crash-aware variant (`fault_tolerance_exp.py`) models each relay independently failing with probability `crash_prob` per round and derives protocol parameters (relay capacity cap and leaf retry budget) analytically from the crash probability.
 
-Enjoy exploring **Federated**, **P2P**, and **Hubs-and-Spokes** learning methods in a single code base!
+```bash
+# 20% expected relay crash rate, G6 config (700 edges)
+python fault_tolerance_exp.py \
+    --dataset cifar10 --num_leaves 100 \
+    --num_relays 20 --b_lr 15 --b_rr 10 --b_rl 2 \
+    --crash_type relay --crash_prob 0.2 \
+    --lr 0.1 --bias 0.1 --num_local_iters 5 \
+    --num_rounds 1000 --eval_time 10 --num_workers 10 \
+    --monitor_model_drift --gpu 0 --seed 108 \
+    --exp ft_relay_p20_cifar10_s100h20_G6
+```
+
+---
+
+## Graph Simulation
+
+To profile spectral gap and degree statistics without running training:
+
+```bash
+# TGL spectral gap simulation
+python main.py --graph_simulation_only \
+    --aggregation tgl --num_leaves 100 --num_relays 20 \
+    --b_lr 10 --b_rr 5 --b_rl 1 \
+    --num_rounds 1000 --gpu 0 --seed 108 \
+    --exp sim_tgl_G3
+
+# HSL (heterogeneous P2P baseline) spectral gap
+python main.py --graph_simulation_only \
+    --aggregation p2p --topo hsl \
+    --num_leaves 100 --num_relays 20 \
+    --hub_degree 10 --spoke_degree 2 \
+    --num_rounds 1000 --gpu 0 --seed 108 \
+    --exp sim_hsl_G3
+```
+
+---
+
+## Datasets and Training Configurations
+
+| Dataset | Model | Params | Nodes | lr | Local steps | Batch | Rounds |
+|---|---|---|---|---|---|---|---|
+| CIFAR-10 | ResNet-20 | 0.27M | 100, 200 | 0.1 | 5 | 128 | 1000 |
+| FEMNIST | CNN | 6.6M | 175, 350 | 0.02 | 3 | 32 | 1000 |
+| AG News | Tiny Transformer | 12.9M | 100, 200 | 0.04 | 4 | 64 | 1000 |
+
+FEMNIST uses natural writer-level non-IID structure. CIFAR-10 and AG News use a Dirichlet concentration parameter of α=0.1 for 100-node experiments and α=0.5 for 200-node experiments, with uniform sample counts enforced across nodes to isolate label heterogeneity from data imbalance.
+
+---
+
+## Output Format
+
+Each run writes `outputs/<exp>_metrics.json` with keys `round`, `global_acc` (list of per-node accuracies at each eval round), `global_loss`, `pre_drift`, `post_drift` (if `--monitor_model_drift`). Fault tolerance runs additionally include `avg_relay_s1_zeros`, `avg_leaf_s3_zeros`, `avg_leaf_s3_partials`, and `relay_cap`.
+
+---
